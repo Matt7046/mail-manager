@@ -1,0 +1,11 @@
+{
+  "name": "Mail Manager",
+  "short_name": "Mail",
+  "description": "Inbox multi-casella + PEC — colorsdev.tech",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "orientation": "any",
+  "icons": []
+}

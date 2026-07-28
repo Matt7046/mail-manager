@@ -49,10 +49,19 @@ yarn install
 npx expo start --web
 ```
 
-## Deploy (come Password Manager)
+## Deploy → https://mail.colorsdev.tech
 
-Tunnel Cloudflare → nginx dedicato → API `mail-manager:8000`, web static export sotto `/web`.  
-Non toccare nginx di Activity Manager.
+Come **Password Manager**: DNS **GoDaddy** → VPS → nginx Activity Manager (`/root/nginx-apps/mail.colorsdev.tech.conf`) + API Docker sulla rete `backend_app-network`.
+
+```bat
+cd backend\bat\deploy
+SETUP-SERVER.BAT          rem conf nginx-apps + compose + cert
+rem GoDaddy A record + certbot per mail.colorsdev.tech
+DEPLOY-ALL.BAT            rem API Hub + web static
+```
+
+Script: `SETUP-SERVER.BAT` · `DEPLOY-API.BAT` · `DEPLOY-WEB.BAT` · `DEPLOY-ALL.BAT`  
+Niente Cloudflare Tunnel.
 
 ## Cosa non è ancora wired
 

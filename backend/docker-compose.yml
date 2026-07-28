@@ -1,27 +1,38 @@
+# Mail Manager API — rete Docker condivisa con Activity Manager.
+# Web + TLS: nginx AM (GoDaddy DNS → VPS) via /root/nginx-apps/mail.colorsdev.tech.conf
+# Immagine: docker.io/matt7046/mail-manager:2.0.0
+
 services:
   mail-manager:
-    build: .
-    image: matt7046/mail-manager:2.0.0
+    image: docker.io/matt7046/mail-manager:2.0.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mail-manager
+    restart: always
     env_file:
       - .env
+    environment:
+      DB_NAME: ${DB_NAME:-mail_manager}
+      MONGO_CERT_PATH: /app/certificate/client.pem
+      MONGO_KEY_PATH: /app/certificate/client-key.pem
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://mail.colorsdev.tech,http://localhost:8081}
     volumes:
-      - ./certificate:/app/certificate:ro
+      - ${MONGO_CERT_HOST_PATH:-./certificate}:/app/certificate:ro
+    expose:
+      - "8000"
     networks:
-      - app-network
-    restart: unless-stopped
-
-  mail-manager-nginx:
-    image: nginx:alpine
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ../web:/usr/share/nginx/html:ro
-    depends_on:
-      - mail-manager
-    networks:
-      - app-network
-    restart: unless-stopped
+      app-network:
+        aliases:
+          - mail-manager
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 networks:
   app-network:
     external: true
-    name: backend_app-network
+    name: ${COMPOSE_NETWORK:-backend_app-network}

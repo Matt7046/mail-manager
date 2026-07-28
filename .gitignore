@@ -1,6 +1,7 @@
 .env
 frontend/.env
 backend/.env
+backend/bat/deploy/config.bat
 frontend/node_modules/
 frontend/dist/
 frontend/.expo/
@@ -8,3 +9,4 @@ frontend/.expo/
 *.pyc
 .venv/
 certificate/
+backend/certificate/*.pem

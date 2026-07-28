@@ -1,0 +1,15 @@
+@echo off
+rem Copia come config.bat e adatta se serve.
+
+set "DEPLOY_HOST=173.212.220.20"
+set "DEPLOY_USER=root"
+set "DEPLOY_API_PATH=/root/mail-manager/backend"
+set "DEPLOY_COMPOSE_FILE=docker-compose.yml"
+set "DEPLOY_COMPOSE_NETWORK=backend_app-network"
+set "DEPLOY_WEB_PATH=/root/mail-manager/web"
+set "DEPLOY_NGINX_CONTAINER=nginx"
+set "DEPLOY_HUB_IMAGE=docker.io/matt7046/mail-manager:2.0.0"
+set "DEPLOY_NGINX_APPS=/root/nginx-apps"
+
+rem Opzionale:
+rem set "DEPLOY_SSH_KEY=%USERPROFILE%\.ssh\id_ed25519"
