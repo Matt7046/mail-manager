@@ -1,0 +1,27 @@
+services:
+  mail-manager:
+    build: .
+    image: matt7046/mail-manager:2.0.0
+    env_file:
+      - .env
+    volumes:
+      - ./certificate:/app/certificate:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  mail-manager-nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../web:/usr/share/nginx/html:ro
+    depends_on:
+      - mail-manager
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    external: true
+    name: backend_app-network

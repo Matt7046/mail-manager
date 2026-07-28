@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Mail Manager",
+    "slug": "mail-manager",
+    "version": "2.0.0",
+    "orientation": "default",
+    "scheme": "mailmanager",
+    "userInterfaceStyle": "automatic",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": ["expo-router", "expo-secure-store"],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

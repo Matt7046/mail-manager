@@ -1,0 +1,111 @@
+const BASE =
+  (typeof process !== 'undefined' && process.env.EXPO_PUBLIC_BACKEND_URL) ||
+  'http://localhost:8000';
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers || {}),
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((data as any)?.detail || (data as any)?.message || res.statusText);
+  }
+  return data as T;
+}
+
+export type Account = {
+  id: string;
+  type: 'google' | 'microsoft' | 'imap' | 'pec';
+  label: string;
+  address: string;
+  color: string;
+  pec_provider?: string | null;
+  last_sync_at?: string | null;
+  sync_state?: string;
+};
+
+export type MessageListItem = {
+  id: string;
+  account_id: string;
+  subject: string;
+  from: string;
+  to: string[];
+  date?: string;
+  flags?: { seen?: boolean; flagged?: boolean; archived?: boolean };
+  has_attachments?: boolean;
+  is_pec?: boolean;
+  snippet?: string;
+  priority?: string | null;
+};
+
+export const api = {
+  checkSetup: (email?: string) =>
+    req<{ setup_done: boolean; email: string }>(
+      `/api/auth/check_setup${email ? `?email=${encodeURIComponent(email)}` : ''}`,
+    ),
+  setup: (email: string, master_password: string) =>
+    req<{ email: string }>('/api/auth/setup', {
+      method: 'POST',
+      body: JSON.stringify({ email, master_password }),
+    }),
+  login: (email: string, master_password: string) =>
+    req<{ email: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, master_password }),
+    }),
+  listAccounts: (email: string, master_password: string) =>
+    req<Account[]>(
+      `/api/accounts?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+    ),
+  pecPresets: () => req<Record<string, unknown>>('/api/accounts/pec-presets'),
+  addImapAccount: (body: Record<string, unknown>) =>
+    req<Account>('/api/accounts/imap', { method: 'POST', body: JSON.stringify(body) }),
+  deleteAccount: (id: string, email: string, master_password: string) =>
+    req(`/api/accounts/${id}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`, {
+      method: 'DELETE',
+    }),
+  listMessages: (params: {
+    email: string;
+    master_password: string;
+    account?: string;
+    q?: string;
+    unread?: boolean;
+    pec?: boolean;
+  }) => {
+    const sp = new URLSearchParams({
+      email: params.email,
+      master_password: params.master_password,
+    });
+    if (params.account) sp.set('account', params.account);
+    if (params.q) sp.set('q', params.q);
+    if (params.unread) sp.set('unread', 'true');
+    if (params.pec) sp.set('pec', 'true');
+    return req<{ items: MessageListItem[]; total: number }>(`/api/messages?${sp}`);
+  },
+  getMessage: (id: string, email: string, master_password: string) =>
+    req<any>(
+      `/api/messages/${id}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+    ),
+  sendMessage: (body: Record<string, unknown>) =>
+    req<any>('/api/messages/send', { method: 'POST', body: JSON.stringify(body) }),
+  syncRun: (email: string, master_password: string) =>
+    req(
+      `/api/sync/run?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+      { method: 'POST' },
+    ),
+  seedDemo: (email: string, master_password: string) =>
+    req(
+      `/api/dev/seed_demo?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+      { method: 'POST' },
+    ),
+  listRules: (email: string, master_password: string) =>
+    req<any[]>(
+      `/api/rules?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+    ),
+  createRule: (body: Record<string, unknown>) =>
+    req('/api/rules', { method: 'POST', body: JSON.stringify(body) }),
+};
