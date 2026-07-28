@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import {
-  View,
   Text,
   TextInput,
   TouchableOpacity,
@@ -8,6 +7,7 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Image,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
@@ -40,8 +40,14 @@ export default function Setup() {
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
+      <Image
+        source={{ uri: '/logo-mail-manager.png' }}
+        style={styles.logo}
+        resizeMode="contain"
+        accessibilityLabel="Mail Manager"
+      />
       <Text style={styles.brand}>Crea vault</Text>
-      <Text style={styles.sub}>Mail Manager v2 — master password locale al vault</Text>
+      <Text style={styles.sub}>Master password locale al vault</Text>
       <TextInput
         style={styles.input}
         placeholder="Email"
@@ -73,8 +79,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
-  brand: { color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 4 },
-  sub: { color: '#999', marginBottom: 32 },
+  logo: {
+    width: '100%',
+    height: 100,
+    marginBottom: 12,
+    alignSelf: 'center',
+  },
+  brand: { color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 4, textAlign: 'center' },
+  sub: { color: '#999', marginBottom: 32, textAlign: 'center' },
   input: {
     backgroundColor: '#16213e',
     borderRadius: 12,

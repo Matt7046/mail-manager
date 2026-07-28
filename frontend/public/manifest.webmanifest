@@ -1,11 +1,71 @@
 {
+  "id": "/",
   "name": "Mail Manager",
   "short_name": "Mail",
   "description": "Inbox multi-casella + PEC — colorsdev.tech",
+  "lang": "it",
+  "dir": "ltr",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "orientation": "any",
   "background_color": "#0b1220",
   "theme_color": "#0b1220",
-  "orientation": "any",
-  "icons": []
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/pwa/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/pwa/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/pwa/screenshot-wide.png",
+      "sizes": "1280x720",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Mail Manager desktop"
+    },
+    {
+      "src": "/pwa/screenshot-narrow.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Mail Manager mobile"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Accedi",
+      "short_name": "Login",
+      "url": "/login",
+      "icons": [{ "src": "/pwa/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
+  "prefer_related_applications": false,
+  "launch_handler": {
+    "client_mode": ["navigate-existing", "auto"]
+  },
+  "handle_links": "preferred"
 }

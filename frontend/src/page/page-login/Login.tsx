@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import {
-  View,
   Text,
   TextInput,
   TouchableOpacity,
@@ -8,6 +7,7 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Image,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
@@ -36,7 +36,12 @@ export default function Login() {
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <Text style={styles.brand}>Mail Manager</Text>
+      <Image
+        source={{ uri: '/logo-mail-manager.png' }}
+        style={styles.logo}
+        resizeMode="contain"
+        accessibilityLabel="Mail Manager"
+      />
       <Text style={styles.sub}>v2 — inbox + PEC</Text>
       <TextInput
         style={styles.input}
@@ -69,8 +74,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
-  brand: { color: '#fff', fontSize: 32, fontWeight: '700', marginBottom: 4 },
-  sub: { color: '#4ecdc4', marginBottom: 32 },
+  logo: {
+    width: '100%',
+    height: 120,
+    marginBottom: 8,
+    alignSelf: 'center',
+  },
+  sub: { color: '#4ecdc4', marginBottom: 32, textAlign: 'center' },
   input: {
     backgroundColor: '#16213e',
     borderRadius: 12,

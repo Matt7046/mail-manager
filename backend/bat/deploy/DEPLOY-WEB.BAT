@@ -44,10 +44,23 @@ if errorlevel 1 (
   call npm.cmd install
   if errorlevel 1 exit /b 1
 )
+echo.
+echo === PWA ASSETS ===
+call node .\scripts\generate-pwa-assets.mjs --rebuild-logo
+if errorlevel 1 exit /b 1
 call npx.cmd expo export --platform web
 if errorlevel 1 exit /b 1
+call node .\scripts\patch-web-html.mjs
 if exist "public\manifest.webmanifest" copy /Y "public\manifest.webmanifest" "dist\manifest.webmanifest" >nul
 if exist "public\sw.js" copy /Y "public\sw.js" "dist\sw.js" >nul
+if exist "public\favicon.ico" copy /Y "public\favicon.ico" "dist\favicon.ico" >nul
+if exist "public\favicon.png" copy /Y "public\favicon.png" "dist\favicon.png" >nul
+if exist "public\apple-touch-icon.png" copy /Y "public\apple-touch-icon.png" "dist\apple-touch-icon.png" >nul
+if exist "public\logo-mail-manager.png" copy /Y "public\logo-mail-manager.png" "dist\logo-mail-manager.png" >nul
+if exist "public\pwa" (
+  if not exist "dist\pwa" mkdir "dist\pwa"
+  xcopy /E /I /Y "public\pwa\*" "dist\pwa\" >nul
+)
 echo [OK] Export in %DIST_DIR%
 goto :after_export
 :skip_export
