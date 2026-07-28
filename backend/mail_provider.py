@@ -29,11 +29,16 @@ IMAP_PRESETS: Dict[str, Dict[str, Any]] = {
     "outlook": {
         "imap_host": "outlook.office365.com",
         "imap_port": 993,
-        "smtp_host": "smtp.office365.com",
+        "smtp_host": "smtp-mail.outlook.com",
         "smtp_port": 587,
         "smtp_ssl": False,
         "smtp_starttls": True,
-        "hint": "Abilita IMAP in Outlook e usa password o app password Microsoft.",
+        "imap_fallbacks": ["imap-mail.outlook.com"],
+        "hint": (
+            "Outlook/Hotmail: 1) Outlook.com → Impostazioni → Posta → Inoltro e IMAP → abilita IMAP. "
+            "2) account.microsoft.com → Sicurezza → Password per le app. "
+            "Se fallisce ancora, Microsoft può richiedere OAuth (non solo app password)."
+        ),
     },
     "aruba": {
         "imap_host": "imaps.pec.aruba.it",
@@ -159,14 +164,45 @@ def _imap_auth_error(exc: Exception, host: str) -> RuntimeError:
                 "Login Gmail rifiutato. Usa una App Password (non la password dell'account), "
                 "con 2FA attiva. Google Account → Sicurezza → Password per le app."
             )
+    if any(
+        x in host.lower()
+        for x in ("outlook", "office365", "hotmail", "live.com")
+    ) or "microsoft" in low:
+        return RuntimeError(
+            "Login Microsoft/Outlook rifiutato (AUTHENTICATE failed). "
+            "L’inoltro email NON serve. Serve: Impostazioni Outlook.com → Posta → Inoltro e IMAP → "
+            "«Consenti a dispositivi e app di usare IMAP» = ON. "
+            "Se IMAP è già attivo e usi App Password, Microsoft ha disabilitato l’accesso con password su questa casella: "
+            "serve login OAuth (Modern Auth). "
+            f"Dettaglio: {msg}"
+        )
     return RuntimeError(f"IMAP {host}: {msg}")
+
+
+def _try_imap_login(client: imaplib.IMAP4_SSL, user: str, password: str) -> None:
+    pwd = normalize_mailbox_secret(password)
+    try:
+        client.login(user, pwd)
+        return
+    except Exception as login_exc:
+        # Alcuni server Microsoft accettano AUTH PLAIN ma non LOGIN.
+        try:
+            def _plain(_challenge: bytes) -> bytes:
+                return f"\0{user}\0{pwd}".encode("utf-8")
+
+            typ, _ = client.authenticate("PLAIN", _plain)
+            if typ == "OK":
+                return
+        except Exception:
+            pass
+        raise login_exc
 
 
 def _imap_connect(host: str, port: int, user: str, password: str) -> imaplib.IMAP4_SSL:
     ctx = ssl.create_default_context()
     client = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=45)
     try:
-        client.login(user, normalize_mailbox_secret(password))
+        _try_imap_login(client, user, password)
     except Exception as exc:
         try:
             client.shutdown()
@@ -176,16 +212,99 @@ def _imap_connect(host: str, port: int, user: str, password: str) -> imaplib.IMA
     return client
 
 
-def test_imap(host: str, port: int, user: str, password: str) -> Dict[str, Any]:
+def _outlook_hosts(primary: str) -> List[str]:
+    hosts = [primary]
+    for h in IMAP_PRESETS.get("outlook", {}).get("imap_fallbacks") or []:
+        if h not in hosts:
+            hosts.append(h)
+    for h in ("outlook.office365.com", "imap-mail.outlook.com"):
+        if h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+def _imap_connect_xoauth2(host: str, port: int, user: str, access_token: str) -> imaplib.IMAP4_SSL:
+    ctx = ssl.create_default_context()
+    client = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=45)
+    try:
+        auth_str = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+
+        def _xoauth2(_challenge: bytes) -> bytes:
+            return auth_str.encode("utf-8")
+
+        typ, data = client.authenticate("XOAUTH2", _xoauth2)
+        if typ != "OK":
+            raise RuntimeError(f"XOAUTH2 fallito: {typ} {data}")
+    except Exception as exc:
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+        raise _imap_auth_error(exc, host) from exc
+    return client
+
+
+def connect_mailbox(
+    host: str,
+    port: int,
+    user: str,
+    password: str = "",
+    *,
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Tuple[imaplib.IMAP4_SSL, str]:
+    """Connette IMAP con password oppure XOAUTH2."""
+    if access_token:
+        is_outlook = (provider_hint or "").lower() in ("outlook", "microsoft") or any(
+            x in (host or "").lower() for x in ("outlook", "office365", "hotmail")
+        )
+        hosts = _outlook_hosts(host) if is_outlook else [host]
+        errors: List[str] = []
+        for h in hosts:
+            try:
+                return _imap_connect_xoauth2(h, port, user, access_token), h
+            except Exception as exc:
+                errors.append(f"{h}: {exc}")
+        raise RuntimeError(" | ".join(errors) if errors else "XOAUTH2 IMAP fallito")
+
+    is_outlook = (provider_hint or "").lower() in ("outlook", "microsoft") or any(
+        x in (host or "").lower() for x in ("outlook", "office365", "hotmail")
+    )
+    hosts = _outlook_hosts(host) if is_outlook else [host]
+    errors = []
+    for h in hosts:
+        try:
+            return _imap_connect(h, port, user, password), h
+        except Exception as exc:
+            errors.append(f"{h}: {exc}")
+    raise RuntimeError(" | ".join(errors) if errors else "Connessione IMAP fallita")
+
+
+def test_imap(
+    host: str,
+    port: int,
+    user: str,
+    password: str = "",
+    *,
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
     if not (user or "").strip():
-        raise RuntimeError("Utente IMAP vuoto: inserisci l'indirizzo Gmail completo")
-    client = _imap_connect(host, port, user.strip(), password)
+        raise RuntimeError("Utente IMAP vuoto: inserisci l'indirizzo email completo")
+    client, used_host = connect_mailbox(
+        host,
+        port,
+        user.strip(),
+        password,
+        provider_hint=provider_hint,
+        access_token=access_token,
+    )
     try:
         typ, data = client.select("INBOX", readonly=True)
         if typ != "OK":
             raise RuntimeError(f"SELECT INBOX fallito: {typ}")
         count = int(data[0]) if data and data[0] else 0
-        return {"ok": True, "inbox_count": count, "host": host, "user": user.strip()}
+        return {"ok": True, "inbox_count": count, "host": used_host, "user": user.strip()}
     finally:
         try:
             client.logout()
@@ -197,12 +316,21 @@ def fetch_inbox(
     host: str,
     port: int,
     user: str,
-    password: str,
+    password: str = "",
     *,
     limit: int = 50,
     account_type: str = "imap",
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    client = _imap_connect(host, port, user, password)
+    client, _used = connect_mailbox(
+        host,
+        port,
+        user,
+        password,
+        provider_hint=provider_hint or account_type,
+        access_token=access_token,
+    )
     messages: List[Dict[str, Any]] = []
     try:
         typ, _ = client.select("INBOX", readonly=True)
@@ -281,7 +409,7 @@ def send_smtp(
     host: str,
     port: int,
     user: str,
-    password: str,
+    password: str = "",
     from_addr: str,
     to_addrs: List[str],
     cc_addrs: Optional[List[str]] = None,
@@ -291,6 +419,7 @@ def send_smtp(
     body_html: Optional[str] = None,
     use_ssl: bool = True,
     starttls: bool = False,
+    access_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     cc_addrs = cc_addrs or []
     bcc_addrs = bcc_addrs or []
@@ -320,9 +449,21 @@ def send_smtp(
 
     ctx = ssl.create_default_context()
     pwd = normalize_mailbox_secret(password)
+
+    def _login(smtp: smtplib.SMTP) -> None:
+        if access_token:
+            auth_str = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+
+            def _xoauth2(_challenge=None):
+                return auth_str
+
+            smtp.auth("XOAUTH2", _xoauth2, initial_response_ok=True)
+        else:
+            smtp.login(user, pwd)
+
     if use_ssl and not starttls:
         with smtplib.SMTP_SSL(host, port, context=ctx, timeout=60) as smtp:
-            smtp.login(user, pwd)
+            _login(smtp)
             smtp.sendmail(from_addr, recipients, payload)
     else:
         with smtplib.SMTP(host, port, timeout=60) as smtp:
@@ -330,7 +471,7 @@ def send_smtp(
             if starttls or port == 587:
                 smtp.starttls(context=ctx)
                 smtp.ehlo()
-            smtp.login(user, pwd)
+            _login(smtp)
             smtp.sendmail(from_addr, recipients, payload)
 
     return {"ok": True, "recipients": recipients}

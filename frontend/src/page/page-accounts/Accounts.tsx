@@ -25,12 +25,12 @@ const PRESETS: Record<
     smtp_port: 465,
     hint: 'Gmail: serve una App Password (Google Account → Sicurezza → Password per le app), non la password normale. Puoi incollarla con o senza spazi.',
   },
-  outlook: {
+    outlook: {
     imap_host: 'outlook.office365.com',
     imap_port: 993,
-    smtp_host: 'smtp.office365.com',
+    smtp_host: 'smtp-mail.outlook.com',
     smtp_port: 587,
-    hint: 'Outlook/Hotmail: abilita IMAP e usa password o app password Microsoft.',
+    hint: 'Outlook: NON serve l’inoltro. Serve solo «Consenti a dispositivi e app di usare IMAP» (Impostazioni → Posta → Inoltro e IMAP). Indirizzo = la casella Microsoft (es. ...@outlook.it). Se con App Password vedi AUTHENTICATE failed, Microsoft ha bloccato la login con password: serve OAuth.',
   },
   aruba: {
     imap_host: 'imaps.pec.aruba.it',
@@ -71,10 +71,20 @@ function notify(title: string, message: string) {
   }
 }
 
+function providerFromAccount(a: Account): Provider {
+  const p = (a.pec_provider || '').toLowerCase();
+  if (p in PRESETS) return p as Provider;
+  if (a.type === 'google') return 'gmail';
+  if (a.type === 'microsoft') return 'outlook';
+  if (a.type === 'pec') return 'other';
+  return 'other';
+}
+
 export default function Accounts() {
   const { userEmail, masterPassword } = useAuth();
   const router = useRouter();
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [label, setLabel] = useState('Gmail');
   const [address, setAddress] = useState('');
   const [imapUser, setImapUser] = useState('');
@@ -83,6 +93,11 @@ export default function Accounts() {
   const [customHost, setCustomHost] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [oauthCfg, setOauthCfg] = useState<{ google: boolean; microsoft: boolean }>({
+    google: false,
+    microsoft: false,
+  });
+  const [oauthBusy, setOauthBusy] = useState<'google' | 'microsoft' | null>(null);
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
@@ -92,8 +107,46 @@ export default function Accounts() {
   useFocusEffect(
     useCallback(() => {
       load().catch((e) => setStatus({ ok: false, text: e.message }));
+      api
+        .oauthStatus()
+        .then((s) =>
+          setOauthCfg({ google: s.google.configured, microsoft: s.microsoft.configured }),
+        )
+        .catch(() => setOauthCfg({ google: false, microsoft: false }));
     }, [load]),
   );
+
+  const startOAuth = async (provider: 'google' | 'microsoft') => {
+    if (!userEmail || !masterPassword) return;
+    if (!oauthCfg[provider]) {
+      setStatus({
+        ok: false,
+        text: `${provider === 'google' ? 'Google' : 'Microsoft'} OAuth non configurato sul server (CLIENT_ID/SECRET).`,
+      });
+      return;
+    }
+    setOauthBusy(provider);
+    try {
+      const res = await api.oauthStart(provider, userEmail, masterPassword);
+      const pending = JSON.stringify({
+        email: userEmail,
+        master_password: masterPassword,
+        provider,
+      });
+      try {
+        sessionStorage.setItem('mm_oauth_pending', pending);
+        localStorage.setItem('mm_oauth_pending', pending);
+      } catch {
+        /* ignore */
+      }
+      if (typeof window !== 'undefined') {
+        window.location.href = res.authorize_url;
+      }
+    } catch (e: any) {
+      setStatus({ ok: false, text: e.message });
+      setOauthBusy(null);
+    }
+  };
 
   const isPec =
     provider === 'aruba' ||
@@ -101,7 +154,32 @@ export default function Accounts() {
     provider === 'postecert' ||
     provider === 'intesi';
 
-  const add = async () => {
+  const resetForm = () => {
+    setEditingId(null);
+    setProvider('gmail');
+    setLabel('Gmail');
+    setAddress('');
+    setImapUser('');
+    setImapPassword('');
+    setCustomHost('');
+  };
+
+  const startEdit = (a: Account) => {
+    const p = providerFromAccount(a);
+    setEditingId(a.id);
+    setProvider(p);
+    setLabel(a.label || p);
+    setAddress(a.address || '');
+    setImapUser(a.imap_user || a.address || '');
+    setImapPassword('');
+    setCustomHost(p === 'other' ? a.imap_host || '' : '');
+    setStatus({
+      ok: true,
+      text: `Modifica «${a.label}» — aggiorna i campi sotto e salva. Lascia vuota la password per non cambiarla.`,
+    });
+  };
+
+  const save = async () => {
     if (!userEmail || !masterPassword) return;
     const p = PRESETS[provider];
     const host = provider === 'other' ? customHost : p.imap_host;
@@ -116,35 +194,58 @@ export default function Accounts() {
       setStatus({ ok: false, text: 'Inserisci l’indirizzo email della casella' });
       return;
     }
-    if (!secret) {
+    if (!editingId && !secret) {
       setStatus({
         ok: false,
-        text: provider === 'gmail' ? 'Serve una App Password Google' : 'Password richiesta',
+        text:
+          provider === 'gmail'
+            ? 'Serve una App Password Google'
+            : provider === 'outlook'
+              ? 'Serve una App Password Microsoft'
+              : 'Password richiesta',
       });
       return;
     }
+
+    const payload: Record<string, unknown> = {
+      email: userEmail,
+      master_password: masterPassword,
+      label: label || provider,
+      address: addr,
+      account_type: isPec
+        ? 'pec'
+        : provider === 'gmail'
+          ? 'google'
+          : provider === 'outlook'
+            ? 'microsoft'
+            : 'imap',
+      imap_host: host,
+      imap_port: p.imap_port,
+      imap_user: user,
+      smtp_host: provider === 'other' ? host : p.smtp_host,
+      smtp_port: p.smtp_port,
+      pec_provider: provider === 'other' ? null : provider,
+      color: isPec ? '#e040a0' : provider === 'gmail' ? '#ea4335' : provider === 'outlook' ? '#0078d4' : '#4ecdc4',
+    };
+    if (secret) payload.imap_password = secret;
+
     try {
-      await api.addImapAccount({
-        email: userEmail,
-        master_password: masterPassword,
-        label: label || provider,
-        address: addr,
-        account_type: isPec ? 'pec' : provider === 'gmail' ? 'google' : provider === 'outlook' ? 'microsoft' : 'imap',
-        imap_host: host,
-        imap_port: p.imap_port,
-        imap_user: user,
-        imap_password: secret,
-        smtp_host: provider === 'other' ? host : p.smtp_host,
-        smtp_port: p.smtp_port,
-        pec_provider: provider === 'other' ? null : provider,
-        color: isPec ? '#e040a0' : provider === 'gmail' ? '#ea4335' : '#4ecdc4',
-      });
+      if (editingId) {
+        await api.updateImapAccount(editingId, payload);
+        setStatus({ ok: true, text: 'Account aggiornato. Premi Test IMAP + sync per verificare.' });
+        notify('OK', 'Account aggiornato');
+      } else {
+        payload.imap_password = secret;
+        await api.addImapAccount(payload);
+        setStatus({
+          ok: true,
+          text: 'Account salvato. Premi Test IMAP, poi torna in Inbox e scorri in basso per sincronizzare.',
+        });
+        notify('OK', 'Account salvato');
+      }
       setImapPassword('');
+      setEditingId(null);
       await load();
-      const msg =
-        'Account salvato. Premi Test IMAP, poi torna in Inbox e scorri in basso per sincronizzare.';
-      setStatus({ ok: true, text: msg });
-      notify('OK', msg);
     } catch (e: any) {
       setStatus({ ok: false, text: e.message });
       notify('Errore', e.message);
@@ -155,6 +256,7 @@ export default function Accounts() {
     if (!userEmail || !masterPassword) return;
     try {
       await api.deleteAccount(id, userEmail, masterPassword);
+      if (editingId === id) resetForm();
       await load();
       setStatus({ ok: true, text: 'Account rimosso' });
     } catch (e: any) {
@@ -180,6 +282,7 @@ export default function Accounts() {
           text: `IMAP OK (${data.inbox_count ?? '?'} in INBOX). Sync: +${sync?.inserted ?? 0} nuovi. Torna in Inbox.`,
         });
       }
+      await load();
     } catch (e: any) {
       setStatus({ ok: false, text: e.message || 'Test fallito' });
       notify('Test fallito', e.message || 'Test fallito');
@@ -202,23 +305,77 @@ export default function Accounts() {
       ) : null}
 
       {accounts.map((a) => (
-        <View key={a.id} style={styles.card}>
+        <TouchableOpacity
+          key={a.id}
+          style={[styles.card, editingId === a.id && styles.cardOn]}
+          onPress={() => startEdit(a)}
+          activeOpacity={0.85}
+        >
           <Text style={styles.cardTitle}>
             {a.label} · {a.type}
+            {a.auth_method === 'oauth' ? ' · OAuth' : ''}
           </Text>
           <Text style={styles.cardSub}>{a.address}</Text>
+          {a.last_sync_error ? (
+            <Text style={styles.cardErr} numberOfLines={2}>
+              {a.last_sync_error}
+            </Text>
+          ) : null}
+          <Text style={styles.cardHint}>Tocca per modificare ↓</Text>
           <View style={styles.rowBtns}>
-            <TouchableOpacity onPress={() => test(a.id)} disabled={testingId === a.id}>
+            <TouchableOpacity
+              onPress={(e) => {
+                e.stopPropagation?.();
+                test(a.id);
+              }}
+              disabled={testingId === a.id}
+            >
               <Text style={styles.link}>{testingId === a.id ? 'Test…' : 'Test IMAP + sync'}</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={() => remove(a.id)}>
+            <TouchableOpacity
+              onPress={(e) => {
+                e.stopPropagation?.();
+                remove(a.id);
+              }}
+            >
               <Text style={styles.danger}>Rimuovi</Text>
             </TouchableOpacity>
           </View>
-        </View>
+        </TouchableOpacity>
       ))}
 
-      <Text style={styles.section}>Aggiungi casella</Text>
+      <Text style={styles.section}>Collega con OAuth</Text>
+      <Text style={styles.hint}>
+        Consigliato per Gmail e Outlook: apre il login Google/Microsoft (niente App Password).
+      </Text>
+      <View style={styles.oauthRow}>
+        <TouchableOpacity
+          style={[styles.oauthBtn, styles.oauthGoogle, !oauthCfg.google && styles.oauthDisabled]}
+          onPress={() => startOAuth('google')}
+          disabled={!!oauthBusy}
+        >
+          <Text style={styles.oauthBtnText}>
+            {oauthBusy === 'google' ? '…' : oauthCfg.google ? 'Google' : 'Google (non cfg)'}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.oauthBtn, styles.oauthMs, !oauthCfg.microsoft && styles.oauthDisabled]}
+          onPress={() => startOAuth('microsoft')}
+          disabled={!!oauthBusy}
+        >
+          <Text style={styles.oauthBtnText}>
+            {oauthBusy === 'microsoft' ? '…' : oauthCfg.microsoft ? 'Microsoft' : 'Microsoft (non cfg)'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      <Text style={styles.section}>{editingId ? 'Modifica casella' : 'Aggiungi casella (password)'}</Text>
+      {editingId ? (
+        <TouchableOpacity onPress={resetForm}>
+          <Text style={[styles.link, { marginBottom: 10 }]}>Annulla modifica / nuova casella</Text>
+        </TouchableOpacity>
+      ) : null}
+
       <View style={styles.chips}>
         {(['gmail', 'outlook', 'aruba', 'legalmail', 'postecert', 'intesi', 'other'] as Provider[]).map((p) => (
           <TouchableOpacity
@@ -251,7 +408,7 @@ export default function Accounts() {
       <TextInput style={styles.input} placeholder="Etichetta" placeholderTextColor="#666" value={label} onChangeText={setLabel} />
       <TextInput
         style={styles.input}
-        placeholder="Indirizzo email (Gmail completo)"
+        placeholder="Indirizzo email completo"
         placeholderTextColor="#666"
         autoCapitalize="none"
         keyboardType="email-address"
@@ -273,15 +430,23 @@ export default function Accounts() {
       ) : null}
       <TextInput
         style={styles.input}
-        placeholder={provider === 'gmail' ? 'App Password Google' : 'Password / app password'}
+        placeholder={
+          editingId
+            ? 'Nuova password (vuoto = non cambiare)'
+            : provider === 'gmail'
+              ? 'App Password Google'
+              : provider === 'outlook'
+                ? 'App Password Microsoft'
+                : 'Password / app password'
+        }
         placeholderTextColor="#666"
         secureTextEntry
         autoComplete="off"
         value={imapPassword}
         onChangeText={setImapPassword}
       />
-      <TouchableOpacity style={styles.btn} onPress={add}>
-        <Text style={styles.btnText}>Salva account</Text>
+      <TouchableOpacity style={styles.btn} onPress={save}>
+        <Text style={styles.btnText}>{editingId ? 'Aggiorna account' : 'Salva account'}</Text>
       </TouchableOpacity>
     </ScrollView>
   );
@@ -300,9 +465,14 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 14,
     marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'transparent',
   },
+  cardOn: { borderColor: '#4ecdc4' },
   cardTitle: { color: '#fff', fontWeight: '600' },
   cardSub: { color: '#999', marginTop: 4 },
+  cardErr: { color: '#ff8a8a', marginTop: 6, fontSize: 12 },
+  cardHint: { color: '#666', marginTop: 8, fontSize: 12 },
   rowBtns: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 },
   danger: { color: '#ff6b6b' },
   section: { color: '#4ecdc4', marginTop: 20, marginBottom: 10, fontWeight: '700' },
@@ -333,4 +503,15 @@ const styles = StyleSheet.create({
   },
   btnText: { color: '#0b1220', fontWeight: '700' },
   hint: { color: '#f0c674', marginBottom: 12, fontSize: 13, lineHeight: 18 },
+  oauthRow: { flexDirection: 'row', gap: 10, marginBottom: 8 },
+  oauthBtn: {
+    flex: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  oauthGoogle: { backgroundColor: '#ea4335' },
+  oauthMs: { backgroundColor: '#0078d4' },
+  oauthDisabled: { opacity: 0.45 },
+  oauthBtnText: { color: '#fff', fontWeight: '700' },
 });

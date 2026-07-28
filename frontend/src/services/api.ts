@@ -32,6 +32,13 @@ export type Account = {
   pec_provider?: string | null;
   last_sync_at?: string | null;
   sync_state?: string;
+  last_sync_error?: string | null;
+  imap_host?: string | null;
+  imap_port?: number | null;
+  imap_user?: string | null;
+  smtp_host?: string | null;
+  smtp_port?: number | null;
+  auth_method?: string | null;
 };
 
 export type MessageListItem = {
@@ -70,6 +77,8 @@ export const api = {
   pecPresets: () => req<Record<string, unknown>>('/api/accounts/pec-presets'),
   addImapAccount: (body: Record<string, unknown>) =>
     req<Account>('/api/accounts/imap', { method: 'POST', body: JSON.stringify(body) }),
+  updateImapAccount: (id: string, body: Record<string, unknown>) =>
+    req<Account>(`/api/accounts/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteAccount: (id: string, email: string, master_password: string) =>
     req(`/api/accounts/${id}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`, {
       method: 'DELETE',
@@ -79,6 +88,27 @@ export const api = {
       `/api/accounts/${id}/test?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
       { method: 'POST' },
     ),
+  oauthStatus: () =>
+    req<{
+      google: { configured: boolean; redirect_uri: string };
+      microsoft: { configured: boolean; redirect_uri: string };
+    }>('/api/accounts/oauth/status'),
+  oauthStart: (provider: 'google' | 'microsoft', email: string, master_password: string) =>
+    req<{ authorize_url: string; state: string; provider: string }>(
+      `/api/accounts/oauth/${provider}/start`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ email, master_password }),
+      },
+    ),
+  oauthComplete: (
+    provider: 'google' | 'microsoft',
+    body: { email: string; master_password: string; code: string; state: string },
+  ) =>
+    req<Account>(`/api/accounts/oauth/${provider}/complete`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   listMessages: (params: {
     email: string;
     master_password: string;

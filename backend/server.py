@@ -8,9 +8,11 @@ import base64
 import hashlib
 import logging
 import os
+import secrets
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -21,6 +23,7 @@ from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
 import mail_provider
+import oauth_mail
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -107,13 +110,31 @@ class ImapAccountBody(BaseModel):
     imap_host: str
     imap_port: int = 993
     imap_user: str
-    imap_password: str
+    imap_password: str = ""
     smtp_host: Optional[str] = None
     smtp_port: int = 465
     smtp_user: Optional[str] = None
     smtp_password: Optional[str] = None
-    pec_provider: Optional[str] = None  # aruba | legalmail | postecert | intesi | other
+    pec_provider: Optional[str] = None  # aruba | legalmail | postecert | intesi | outlook | gmail | other
     color: str = "#4ecdc4"
+
+
+class ImapAccountUpdateBody(BaseModel):
+    email: EmailStr
+    master_password: str
+    label: Optional[str] = None
+    address: Optional[EmailStr] = None
+    account_type: Optional[AccountType] = None
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = None
+    imap_user: Optional[str] = None
+    imap_password: Optional[str] = None  # se vuoto/None: non aggiornare
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    pec_provider: Optional[str] = None
+    color: Optional[str] = None
 
 
 class AccountOut(BaseModel):
@@ -125,6 +146,45 @@ class AccountOut(BaseModel):
     pec_provider: Optional[str] = None
     last_sync_at: Optional[datetime] = None
     sync_state: str = "idle"
+    last_sync_error: Optional[str] = None
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = None
+    imap_user: Optional[str] = None
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    auth_method: Optional[str] = None
+
+
+class OAuthStartBody(BaseModel):
+    email: EmailStr
+    master_password: str
+
+
+class OAuthCompleteBody(BaseModel):
+    email: EmailStr
+    master_password: str
+    code: str
+    state: str
+
+
+def public_account(doc: dict) -> AccountOut:
+    return AccountOut(
+        id=str(doc["_id"]),
+        type=doc["type"],
+        label=doc["label"],
+        address=doc["address"],
+        color=doc.get("color", "#4ecdc4"),
+        pec_provider=doc.get("pec_provider"),
+        last_sync_at=doc.get("last_sync_at"),
+        sync_state=doc.get("sync_state", "idle"),
+        last_sync_error=doc.get("last_sync_error"),
+        imap_host=doc.get("imap_host"),
+        imap_port=doc.get("imap_port"),
+        imap_user=doc.get("imap_user"),
+        smtp_host=doc.get("smtp_host"),
+        smtp_port=doc.get("smtp_port"),
+        auth_method=doc.get("auth_method") or "password",
+    )
 
 
 class MessageFlagsBody(BaseModel):
@@ -170,17 +230,72 @@ async def require_user(email: str, master_password: str) -> dict:
     return user
 
 
-def public_account(doc: dict) -> AccountOut:
-    return AccountOut(
-        id=str(doc["_id"]),
-        type=doc["type"],
-        label=doc["label"],
-        address=doc["address"],
-        color=doc.get("color", "#4ecdc4"),
-        pec_provider=doc.get("pec_provider"),
-        last_sync_at=doc.get("last_sync_at"),
-        sync_state=doc.get("sync_state", "idle"),
+def apply_provider_hosts(
+    pec_provider: Optional[str],
+    *,
+    imap_host: Optional[str],
+    imap_port: Optional[int],
+    smtp_host: Optional[str],
+    smtp_port: Optional[int],
+) -> Tuple[str, int, Optional[str], int]:
+    presets = mail_provider.IMAP_PRESETS
+    if pec_provider and pec_provider in presets:
+        preset = presets[pec_provider]
+        return (
+            imap_host or preset["imap_host"],
+            int(imap_port or preset["imap_port"]),
+            smtp_host or preset["smtp_host"],
+            int(smtp_port or preset["smtp_port"]),
+        )
+    return (
+        imap_host or "",
+        int(imap_port or 993),
+        smtp_host,
+        int(smtp_port or 465),
     )
+
+
+def outlook_smtp_flags(pec_provider: Optional[str]) -> Dict[str, bool]:
+    preset = mail_provider.IMAP_PRESETS.get(pec_provider or "", {})
+    return {
+        "smtp_ssl": bool(preset.get("smtp_ssl", True)),
+        "smtp_starttls": bool(preset.get("smtp_starttls", False)),
+    }
+
+
+async def resolve_mailbox_creds(acc: dict, vault_email: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Ritorna (imap_user, password|None, access_token|None), con refresh OAuth se serve."""
+    user = (acc.get("imap_user") or acc.get("address") or "").strip().lower()
+    if acc.get("auth_method") == "oauth" and acc.get("oauth_tokens_enc"):
+        tokens = oauth_mail.tokens_from_json(
+            decrypt_secret(acc["oauth_tokens_enc"], vault_email)
+        )
+        if int(tokens.get("expires_at") or 0) <= int(time.time()):
+            refresh = tokens.get("refresh_token") or ""
+            if not refresh:
+                raise HTTPException(
+                    400, "Sessione OAuth scaduta — ricollega Google/Microsoft"
+                )
+            provider = "google" if acc.get("type") == "google" else "microsoft"
+            refreshed = await oauth_mail.refresh_access_token(provider, refresh)
+            await db.accounts.update_one(
+                {"_id": acc["_id"]},
+                {
+                    "$set": {
+                        "oauth_tokens_enc": encrypt_secret(
+                            oauth_mail.tokens_to_json(refreshed), vault_email
+                        ),
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            )
+            tokens = refreshed
+        return user, None, tokens["access_token"]
+
+    if not acc.get("imap_password_enc"):
+        raise HTTPException(400, "Account senza password né OAuth")
+    pwd = decrypt_secret(acc["imap_password_enc"], vault_email)
+    return user, pwd, None
 
 
 # --- app ---
@@ -273,21 +388,24 @@ async def imap_presets():
 async def add_imap_account(body: ImapAccountBody):
     email = body.email.lower()
     await require_user(email, body.master_password)
-    if body.pec_provider and body.pec_provider in IMAP_PRESETS:
-        preset = IMAP_PRESETS[body.pec_provider]
-        imap_host = body.imap_host or preset["imap_host"]
-        imap_port = body.imap_port or preset["imap_port"]
-        smtp_host = body.smtp_host or preset["smtp_host"]
-        smtp_port = body.smtp_port or preset["smtp_port"]
-    else:
-        imap_host, imap_port = body.imap_host, body.imap_port
-        smtp_host, smtp_port = body.smtp_host, body.smtp_port
+    if not (body.imap_password or "").strip():
+        raise HTTPException(400, "Password IMAP richiesta")
+    imap_host, imap_port, smtp_host, smtp_port = apply_provider_hosts(
+        body.pec_provider,
+        imap_host=body.imap_host,
+        imap_port=body.imap_port,
+        smtp_host=body.smtp_host,
+        smtp_port=body.smtp_port,
+    )
+    flags = outlook_smtp_flags(body.pec_provider)
 
     account_type = body.account_type
     if body.pec_provider == "gmail":
         account_type = "google"
     elif body.pec_provider == "outlook":
         account_type = "microsoft"
+    elif body.pec_provider in ("aruba", "legalmail", "postecert", "intesi"):
+        account_type = "pec"
 
     doc = {
         "user_email": email,
@@ -304,10 +422,8 @@ async def add_imap_account(body: ImapAccountBody):
         ),
         "smtp_host": smtp_host,
         "smtp_port": smtp_port,
-        "smtp_ssl": IMAP_PRESETS.get(body.pec_provider or "", {}).get("smtp_ssl", True),
-        "smtp_starttls": IMAP_PRESETS.get(body.pec_provider or "", {}).get(
-            "smtp_starttls", False
-        ),
+        "smtp_ssl": flags["smtp_ssl"],
+        "smtp_starttls": flags["smtp_starttls"],
         "smtp_user": (
             body.smtp_user or body.imap_user or str(body.address)
         ).strip().lower(),
@@ -327,32 +443,162 @@ async def add_imap_account(body: ImapAccountBody):
     return public_account(doc)
 
 
-@api.post("/accounts/oauth/{provider}/start")
-async def oauth_start(provider: Literal["google", "microsoft"], email: EmailStr):
-    """Hook: restituisce URL OAuth da aprire nel browser."""
-    if provider == "google":
-        cid = os.environ.get("GOOGLE_CLIENT_ID", "")
-        redir = os.environ.get("GOOGLE_REDIRECT_URI", "")
-        if not cid:
-            raise HTTPException(501, "GOOGLE_CLIENT_ID non configurato")
-        url = (
-            "https://accounts.google.com/o/oauth2/v2/auth"
-            f"?client_id={cid}&redirect_uri={redir}"
-            "&response_type=code&scope=https://mail.google.com/"
-            f"&access_type=offline&prompt=consent&state={email}"
-        )
-        return {"authorize_url": url}
-    cid = os.environ.get("MICROSOFT_CLIENT_ID", "")
-    redir = os.environ.get("MICROSOFT_REDIRECT_URI", "")
-    if not cid:
-        raise HTTPException(501, "MICROSOFT_CLIENT_ID non configurato")
-    url = (
-        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-        f"?client_id={cid}&redirect_uri={redir}"
-        "&response_type=code&scope=offline_access%20https://outlook.office.com/IMAP.AccessAsUser.All"
-        f"&state={email}"
+@api.put("/accounts/{account_id}", response_model=AccountOut)
+async def update_imap_account(account_id: str, body: ImapAccountUpdateBody):
+    email = body.email.lower()
+    await require_user(email, body.master_password)
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        oid = ObjectId(account_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "ID non valido") from exc
+    acc = await db.accounts.find_one({"_id": oid, "user_email": email})
+    if not acc:
+        raise HTTPException(404, "Account non trovato")
+
+    pec_provider = body.pec_provider if body.pec_provider is not None else acc.get("pec_provider")
+    imap_host, imap_port, smtp_host, smtp_port = apply_provider_hosts(
+        pec_provider,
+        imap_host=body.imap_host if body.imap_host is not None else acc.get("imap_host"),
+        imap_port=body.imap_port if body.imap_port is not None else acc.get("imap_port"),
+        smtp_host=body.smtp_host if body.smtp_host is not None else acc.get("smtp_host"),
+        smtp_port=body.smtp_port if body.smtp_port is not None else acc.get("smtp_port"),
     )
-    return {"authorize_url": url}
+    flags = outlook_smtp_flags(pec_provider)
+
+    updates: Dict[str, Any] = {
+        "imap_host": imap_host,
+        "imap_port": imap_port,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_ssl": flags["smtp_ssl"],
+        "smtp_starttls": flags["smtp_starttls"],
+        "updated_at": datetime.utcnow(),
+    }
+    if body.label is not None:
+        updates["label"] = body.label
+    if body.address is not None:
+        updates["address"] = str(body.address).lower()
+    if body.imap_user is not None:
+        updates["imap_user"] = body.imap_user.strip().lower()
+    elif body.address is not None:
+        updates["imap_user"] = str(body.address).lower()
+    if body.smtp_user is not None:
+        updates["smtp_user"] = body.smtp_user.strip().lower()
+    if body.color is not None:
+        updates["color"] = body.color
+    if body.pec_provider is not None:
+        updates["pec_provider"] = body.pec_provider
+    if body.account_type is not None:
+        updates["type"] = body.account_type
+    elif pec_provider == "gmail":
+        updates["type"] = "google"
+    elif pec_provider == "outlook":
+        updates["type"] = "microsoft"
+    elif pec_provider in ("aruba", "legalmail", "postecert", "intesi"):
+        updates["type"] = "pec"
+
+    secret = (body.imap_password or "").strip()
+    if secret:
+        enc = encrypt_secret(mail_provider.normalize_mailbox_secret(secret), email)
+        updates["imap_password_enc"] = enc
+        updates["smtp_password_enc"] = encrypt_secret(
+            mail_provider.normalize_mailbox_secret(body.smtp_password or secret),
+            email,
+        )
+
+    await db.accounts.update_one({"_id": oid}, {"$set": updates})
+    doc = await db.accounts.find_one({"_id": oid})
+    return public_account(doc)
+
+
+@api.get("/accounts/oauth/status")
+async def oauth_providers_status():
+    return oauth_mail.oauth_status()
+
+
+@api.post("/accounts/oauth/{provider}/start")
+async def oauth_start(provider: Literal["google", "microsoft"], body: OAuthStartBody):
+    email = body.email.lower()
+    await require_user(email, body.master_password)
+    if not oauth_mail.provider_configured(provider):
+        raise HTTPException(
+            501,
+            f"{provider} OAuth non configurato sul server "
+            f"(manca CLIENT_ID/SECRET in .env). Vedi backend/.env.EMPTY",
+        )
+    state = secrets.token_urlsafe(24)
+    await db.oauth_pending.insert_one(
+        {
+            "state": state,
+            "provider": provider,
+            "user_email": email,
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(minutes=15),
+        }
+    )
+    return {
+        "authorize_url": oauth_mail.build_authorize_url(provider, state),
+        "state": state,
+        "provider": provider,
+    }
+
+
+@api.post("/accounts/oauth/{provider}/complete", response_model=AccountOut)
+async def oauth_complete(provider: Literal["google", "microsoft"], body: OAuthCompleteBody):
+    email = body.email.lower()
+    await require_user(email, body.master_password)
+    if not oauth_mail.provider_configured(provider):
+        raise HTTPException(501, f"{provider} OAuth non configurato")
+
+    pending = await db.oauth_pending.find_one({"state": body.state, "provider": provider})
+    if not pending:
+        raise HTTPException(400, "State OAuth non valido o già usato")
+    if pending.get("user_email") != email:
+        raise HTTPException(400, "State OAuth non corrisponde all'utente vault")
+    if pending.get("expires_at") and pending["expires_at"] < datetime.utcnow():
+        await db.oauth_pending.delete_one({"_id": pending["_id"]})
+        raise HTTPException(400, "State OAuth scaduto — riprova")
+
+    await db.oauth_pending.delete_one({"_id": pending["_id"]})
+
+    try:
+        tokens = await oauth_mail.exchange_code(provider, body.code)
+        mailbox = await oauth_mail.fetch_mailbox_address(
+            provider, tokens["access_token"], tokens.get("id_token")
+        )
+    except Exception as exc:
+        log.exception("OAuth complete failed")
+        raise HTTPException(400, f"OAuth fallito: {exc}") from exc
+
+    defaults = oauth_mail.provider_mailbox_defaults(provider)
+    existing = await db.accounts.find_one(
+        {"user_email": email, "address": mailbox, "auth_method": "oauth"}
+    )
+    doc_set = {
+        **defaults,
+        "user_email": email,
+        "address": mailbox,
+        "imap_user": mailbox,
+        "smtp_user": mailbox,
+        "auth_method": "oauth",
+        "oauth_tokens_enc": encrypt_secret(oauth_mail.tokens_to_json(tokens), email),
+        "imap_password_enc": encrypt_secret("", email),
+        "smtp_password_enc": encrypt_secret("", email),
+        "sync_state": "idle",
+        "updated_at": datetime.utcnow(),
+    }
+    if existing:
+        await db.accounts.update_one({"_id": existing["_id"]}, {"$set": doc_set})
+        doc = await db.accounts.find_one({"_id": existing["_id"]})
+    else:
+        doc_set["created_at"] = datetime.utcnow()
+        doc_set["last_sync_at"] = None
+        res = await db.accounts.insert_one(doc_set)
+        doc = await db.accounts.find_one({"_id": res.inserted_id})
+    return public_account(doc)
 
 
 @api.delete("/accounts/{account_id}")
@@ -387,16 +633,54 @@ async def test_account(account_id: str, email: EmailStr, master_password: str):
     acc = await db.accounts.find_one({"_id": oid, "user_email": email.lower()})
     if not acc:
         raise HTTPException(404, "Account non trovato")
+    # Migra host Outlook obsoleti (smtp.office365.com → smtp-mail.outlook.com)
+    if acc.get("pec_provider") == "outlook" or acc.get("type") == "microsoft":
+        ih, ip, sh, sp = apply_provider_hosts(
+            "outlook",
+            imap_host=None,
+            imap_port=None,
+            smtp_host=None,
+            smtp_port=None,
+        )
+        flags = outlook_smtp_flags("outlook")
+        await db.accounts.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "imap_host": ih,
+                    "imap_port": ip,
+                    "smtp_host": sh,
+                    "smtp_port": sp,
+                    **flags,
+                    "pec_provider": "outlook",
+                    "type": "microsoft",
+                }
+            },
+        )
+        acc = await db.accounts.find_one({"_id": oid}) or acc
     try:
-        pwd = decrypt_secret(acc["imap_password_enc"], email.lower())
+        user, pwd, access_token = await resolve_mailbox_creds(acc, email.lower())
         result = await asyncio.to_thread(
             mail_provider.test_imap,
             acc["imap_host"],
             int(acc.get("imap_port") or 993),
-            acc["imap_user"],
-            pwd,
+            user,
+            pwd or "",
+            provider_hint=acc.get("pec_provider") or acc.get("type"),
+            access_token=access_token,
         )
-        return {**result, "type": acc.get("type"), "address": acc.get("address")}
+        if result.get("host") and result["host"] != acc.get("imap_host"):
+            await db.accounts.update_one(
+                {"_id": oid}, {"$set": {"imap_host": result["host"]}}
+            )
+        return {
+            **result,
+            "type": acc.get("type"),
+            "address": acc.get("address"),
+            "auth_method": acc.get("auth_method") or "password",
+        }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, f"Connessione IMAP fallita: {exc}") from exc
 
@@ -543,13 +827,12 @@ async def send_message(body: SendBody):
 
     smtp_host = acc.get("smtp_host") or acc.get("imap_host")
     smtp_port = int(acc.get("smtp_port") or 465)
-    smtp_user = acc.get("smtp_user") or acc.get("imap_user")
     try:
-        smtp_pwd = decrypt_secret(
-            acc.get("smtp_password_enc") or acc["imap_password_enc"], email
-        )
+        smtp_user, smtp_pwd, access_token = await resolve_mailbox_creds(acc, email)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(400, "Password SMTP non decifrabile") from exc
+        raise HTTPException(400, f"Credenziali SMTP non disponibili: {exc}") from exc
 
     use_ssl = bool(acc.get("smtp_ssl", smtp_port == 465))
     starttls = bool(acc.get("smtp_starttls", smtp_port == 587))
@@ -565,7 +848,7 @@ async def send_message(body: SendBody):
             host=smtp_host,
             port=smtp_port,
             user=smtp_user,
-            password=smtp_pwd,
+            password=smtp_pwd or "",
             from_addr=acc["address"],
             to_addrs=to_addrs,
             cc_addrs=cc_addrs,
@@ -575,6 +858,7 @@ async def send_message(body: SendBody):
             body_html=body.body_html,
             use_ssl=use_ssl,
             starttls=starttls,
+            access_token=access_token,
         )
         send_status = "sent"
         send_error = None
@@ -720,15 +1004,17 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
             {"_id": acc["_id"]}, {"$set": {"sync_state": "running"}}
         )
         try:
-            pwd = decrypt_secret(acc["imap_password_enc"], email_l)
+            user, pwd, access_token = await resolve_mailbox_creds(acc, email_l)
             fetched = await asyncio.to_thread(
                 mail_provider.fetch_inbox,
                 acc["imap_host"],
                 int(acc.get("imap_port") or 993),
-                acc["imap_user"],
-                pwd,
+                user,
+                pwd or "",
                 limit=80,
                 account_type=acc.get("type") or "imap",
+                provider_hint=acc.get("pec_provider") or acc.get("type"),
+                access_token=access_token,
             )
             for m in fetched:
                 key = {
@@ -883,4 +1169,6 @@ async def startup():
     await db.messages.create_index([("user_email", 1), ("date", -1)])
     await db.messages.create_index([("user_email", 1), ("is_pec", 1)])
     await db.outbox.create_index([("user_email", 1), ("status", 1)])
+    await db.oauth_pending.create_index("state", unique=True)
+    await db.oauth_pending.create_index("expires_at", expireAfterSeconds=0)
     log.info("Mail Manager API v2 ready — db=%s", db_name)
