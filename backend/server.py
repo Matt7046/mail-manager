@@ -20,6 +20,8 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
+import mail_provider
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -110,7 +112,7 @@ class ImapAccountBody(BaseModel):
     smtp_port: int = 465
     smtp_user: Optional[str] = None
     smtp_password: Optional[str] = None
-    pec_provider: Optional[str] = None  # aruba | legalmail | postecert | other
+    pec_provider: Optional[str] = None  # aruba | legalmail | postecert | intesi | other
     color: str = "#4ecdc4"
 
 
@@ -242,25 +244,12 @@ async def login(body: LoginBody):
 # --- accounts ---
 
 PEC_PRESETS = {
-    "aruba": {
-        "imap_host": "imaps.pec.aruba.it",
-        "imap_port": 993,
-        "smtp_host": "smtps.pec.aruba.it",
-        "smtp_port": 465,
-    },
-    "legalmail": {
-        "imap_host": "mbox.legalmail.it",
-        "imap_port": 993,
-        "smtp_host": "smtp.legalmail.it",
-        "smtp_port": 465,
-    },
-    "postecert": {
-        "imap_host": "mail.postecert.it",
-        "imap_port": 993,
-        "smtp_host": "mail.postecert.it",
-        "smtp_port": 465,
-    },
+    k: v
+    for k, v in mail_provider.IMAP_PRESETS.items()
+    if k in ("aruba", "legalmail", "postecert", "intesi")
 }
+
+IMAP_PRESETS = mail_provider.IMAP_PRESETS
 
 
 @api.get("/accounts", response_model=List[AccountOut])
@@ -275,12 +264,17 @@ async def pec_presets():
     return PEC_PRESETS
 
 
+@api.get("/accounts/imap-presets")
+async def imap_presets():
+    return IMAP_PRESETS
+
+
 @api.post("/accounts/imap", response_model=AccountOut)
 async def add_imap_account(body: ImapAccountBody):
     email = body.email.lower()
     await require_user(email, body.master_password)
-    if body.account_type == "pec" and body.pec_provider and body.pec_provider in PEC_PRESETS:
-        preset = PEC_PRESETS[body.pec_provider]
+    if body.pec_provider and body.pec_provider in IMAP_PRESETS:
+        preset = IMAP_PRESETS[body.pec_provider]
         imap_host = body.imap_host or preset["imap_host"]
         imap_port = body.imap_port or preset["imap_port"]
         smtp_host = body.smtp_host or preset["smtp_host"]
@@ -289,22 +283,39 @@ async def add_imap_account(body: ImapAccountBody):
         imap_host, imap_port = body.imap_host, body.imap_port
         smtp_host, smtp_port = body.smtp_host, body.smtp_port
 
+    account_type = body.account_type
+    if body.pec_provider == "gmail":
+        account_type = "google"
+    elif body.pec_provider == "outlook":
+        account_type = "microsoft"
+
     doc = {
         "user_email": email,
-        "type": body.account_type,
+        "type": account_type,
         "label": body.label,
         "address": str(body.address).lower(),
         "color": body.color,
         "pec_provider": body.pec_provider,
         "imap_host": imap_host,
         "imap_port": imap_port,
-        "imap_user": body.imap_user,
-        "imap_password_enc": encrypt_secret(body.imap_password, email),
+        "imap_user": (body.imap_user or str(body.address)).strip().lower(),
+        "imap_password_enc": encrypt_secret(
+            mail_provider.normalize_mailbox_secret(body.imap_password), email
+        ),
         "smtp_host": smtp_host,
         "smtp_port": smtp_port,
-        "smtp_user": body.smtp_user or body.imap_user,
+        "smtp_ssl": IMAP_PRESETS.get(body.pec_provider or "", {}).get("smtp_ssl", True),
+        "smtp_starttls": IMAP_PRESETS.get(body.pec_provider or "", {}).get(
+            "smtp_starttls", False
+        ),
+        "smtp_user": (
+            body.smtp_user or body.imap_user or str(body.address)
+        ).strip().lower(),
         "smtp_password_enc": encrypt_secret(
-            body.smtp_password or body.imap_password, email
+            mail_provider.normalize_mailbox_secret(
+                body.smtp_password or body.imap_password
+            ),
+            email,
         ),
         "oauth_tokens_enc": None,
         "last_sync_at": None,
@@ -363,11 +374,12 @@ async def delete_account(account_id: str, email: EmailStr, master_password: str)
 
 @api.post("/accounts/{account_id}/test")
 async def test_account(account_id: str, email: EmailStr, master_password: str):
-    """Probe connessione — stub v2 finché non c'è client IMAP."""
-    await require_user(email.lower(), master_password)
+    """Probe IMAP reale."""
+    import asyncio
     from bson import ObjectId
     from bson.errors import InvalidId
 
+    await require_user(email.lower(), master_password)
     try:
         oid = ObjectId(account_id)
     except InvalidId as exc:
@@ -375,12 +387,18 @@ async def test_account(account_id: str, email: EmailStr, master_password: str):
     acc = await db.accounts.find_one({"_id": oid, "user_email": email.lower()})
     if not acc:
         raise HTTPException(404, "Account non trovato")
-    return {
-        "ok": True,
-        "message": "Credenziali salvate. Sync IMAP reale in arrivo.",
-        "host": acc.get("imap_host"),
-        "type": acc.get("type"),
-    }
+    try:
+        pwd = decrypt_secret(acc["imap_password_enc"], email.lower())
+        result = await asyncio.to_thread(
+            mail_provider.test_imap,
+            acc["imap_host"],
+            int(acc.get("imap_port") or 993),
+            acc["imap_user"],
+            pwd,
+        )
+        return {**result, "type": acc.get("type"), "address": acc.get("address")}
+    except Exception as exc:
+        raise HTTPException(400, f"Connessione IMAP fallita: {exc}") from exc
 
 
 # --- messages ---
@@ -506,10 +524,8 @@ async def set_flags(message_id: str, body: MessageFlagsBody):
 
 @api.post("/messages/send")
 async def send_message(body: SendBody):
-    """
-    v2: accetta anche as_pec=True.
-    Invio SMTP reale = TODO provider; qui crea outbox + messaggio locale + receipt placeholder.
-    """
+    """Invio SMTP reale (Gmail app-password, Outlook, IMAP/PEC)."""
+    import asyncio
     from bson import ObjectId
     from bson.errors import InvalidId
 
@@ -525,15 +541,56 @@ async def send_message(body: SendBody):
     if body.as_pec and acc.get("type") != "pec":
         raise HTTPException(400, "as_pec richiede un account di tipo pec")
 
+    smtp_host = acc.get("smtp_host") or acc.get("imap_host")
+    smtp_port = int(acc.get("smtp_port") or 465)
+    smtp_user = acc.get("smtp_user") or acc.get("imap_user")
+    try:
+        smtp_pwd = decrypt_secret(
+            acc.get("smtp_password_enc") or acc["imap_password_enc"], email
+        )
+    except Exception as exc:
+        raise HTTPException(400, "Password SMTP non decifrabile") from exc
+
+    use_ssl = bool(acc.get("smtp_ssl", smtp_port == 465))
+    starttls = bool(acc.get("smtp_starttls", smtp_port == 587))
+
     now = datetime.utcnow()
+    to_addrs = [str(x).lower() for x in body.to]
+    cc_addrs = [str(x).lower() for x in body.cc]
+    bcc_addrs = [str(x).lower() for x in body.bcc]
+
+    try:
+        await asyncio.to_thread(
+            mail_provider.send_smtp,
+            host=smtp_host,
+            port=smtp_port,
+            user=smtp_user,
+            password=smtp_pwd,
+            from_addr=acc["address"],
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            bcc_addrs=bcc_addrs,
+            subject=body.subject,
+            body_text=body.body_text or "",
+            body_html=body.body_html,
+            use_ssl=use_ssl,
+            starttls=starttls,
+        )
+        send_status = "sent"
+        send_error = None
+    except Exception as exc:
+        log.exception("SMTP send failed")
+        send_status = "failed"
+        send_error = str(exc)
+
     receipts = []
     if body.as_pec or acc.get("type") == "pec":
         receipts.append(
             {
                 "type": "accettazione",
                 "at": now.isoformat() + "Z",
-                "status": "pending_provider",
-                "note": "In attesa di invio SMTP PEC reale",
+                "status": "sent" if send_status == "sent" else "failed",
+                "note": send_error or "Inviata via SMTP PEC",
             }
         )
 
@@ -543,8 +600,8 @@ async def send_message(body: SendBody):
         "folder": "sent",
         "subject": body.subject,
         "from_addr": acc["address"],
-        "to_addrs": [str(x).lower() for x in body.to],
-        "cc_addrs": [str(x).lower() for x in body.cc],
+        "to_addrs": to_addrs,
+        "cc_addrs": cc_addrs,
         "date": now,
         "flags": {"seen": True, "flagged": False, "archived": False},
         "has_attachments": False,
@@ -554,7 +611,8 @@ async def send_message(body: SendBody):
         "body_enc": encrypt_secret(body.body_text or "", email),
         "body_html": body.body_html,
         "receipts": receipts,
-        "outbox_status": "queued",
+        "outbox_status": send_status,
+        "send_error": send_error,
         "reply_to_message_id": body.reply_to_message_id,
         "created_at": now,
     }
@@ -565,16 +623,20 @@ async def send_message(body: SendBody):
             "account_id": body.account_id,
             "user_email": email,
             "as_pec": bool(body.as_pec or acc.get("type") == "pec"),
-            "status": "queued",
+            "status": send_status,
+            "error": send_error,
             "created_at": now,
         }
     )
+    if send_status != "sent":
+        raise HTTPException(400, f"Invio fallito: {send_error}")
     return {
         "id": str(res.inserted_id),
-        "queued": True,
+        "queued": False,
+        "sent": True,
         "is_pec": doc["is_pec"],
         "receipts": receipts,
-        "message": "Messaggio in outbox (SMTP provider da collegare)",
+        "message": "Messaggio inviato",
     }
 
 
@@ -635,26 +697,104 @@ async def create_rule(body: RuleBody):
 
 @api.post("/sync/run")
 async def sync_run(email: EmailStr, master_password: str, account_id: Optional[str] = None):
-    await require_user(email.lower(), master_password)
-    filt: Dict[str, Any] = {"user_email": email.lower()}
-    if account_id:
-        from bson import ObjectId
-        from bson.errors import InvalidId
+    """Scarica INBOX via IMAP e upserta i messaggi."""
+    import asyncio
+    from bson import ObjectId
+    from bson.errors import InvalidId
 
+    email_l = email.lower()
+    await require_user(email_l, master_password)
+    filt: Dict[str, Any] = {"user_email": email_l}
+    if account_id:
         try:
             filt["_id"] = ObjectId(account_id)
         except InvalidId as exc:
             raise HTTPException(400, "account_id non valido") from exc
-    n = 0
+
+    synced = 0
+    inserted = 0
+    errors: List[str] = []
     async for acc in db.accounts.find(filt):
+        aid = str(acc["_id"])
         await db.accounts.update_one(
-            {"_id": acc["_id"]},
-            {"$set": {"sync_state": "queued", "last_sync_at": datetime.utcnow()}},
+            {"_id": acc["_id"]}, {"$set": {"sync_state": "running"}}
         )
-        n += 1
+        try:
+            pwd = decrypt_secret(acc["imap_password_enc"], email_l)
+            fetched = await asyncio.to_thread(
+                mail_provider.fetch_inbox,
+                acc["imap_host"],
+                int(acc.get("imap_port") or 993),
+                acc["imap_user"],
+                pwd,
+                limit=80,
+                account_type=acc.get("type") or "imap",
+            )
+            for m in fetched:
+                key = {
+                    "user_email": email_l,
+                    "account_id": aid,
+                    "imap_uid": m["imap_uid"],
+                    "folder": "INBOX",
+                }
+                existing = await db.messages.find_one(key)
+                payload = {
+                    **key,
+                    "message_id": m.get("message_id"),
+                    "subject": m.get("subject", ""),
+                    "from_addr": m.get("from_addr", ""),
+                    "to_addrs": m.get("to_addrs", []),
+                    "cc_addrs": m.get("cc_addrs", []),
+                    "date": m.get("date") or datetime.utcnow(),
+                    "flags": m.get("flags", {}),
+                    "has_attachments": m.get("has_attachments", False),
+                    "attachments": m.get("attachments", []),
+                    "is_pec": m.get("is_pec", False),
+                    "snippet": m.get("snippet", ""),
+                    "body_enc": encrypt_secret(m.get("body_text") or "", email_l),
+                    "body_html": m.get("body_html"),
+                    "receipts": m.get("receipts", []),
+                    "updated_at": datetime.utcnow(),
+                }
+                if existing:
+                    await db.messages.update_one({"_id": existing["_id"]}, {"$set": payload})
+                else:
+                    payload["created_at"] = datetime.utcnow()
+                    await db.messages.insert_one(payload)
+                    inserted += 1
+            synced += 1
+            await db.accounts.update_one(
+                {"_id": acc["_id"]},
+                {
+                    "$set": {
+                        "sync_state": "idle",
+                        "last_sync_at": datetime.utcnow(),
+                        "last_sync_error": None,
+                        "last_sync_count": len(fetched),
+                    }
+                },
+            )
+        except Exception as exc:
+            log.exception("IMAP sync failed for %s", acc.get("address"))
+            errors.append(f"{acc.get('address')}: {exc}")
+            await db.accounts.update_one(
+                {"_id": acc["_id"]},
+                {
+                    "$set": {
+                        "sync_state": "error",
+                        "last_sync_at": datetime.utcnow(),
+                        "last_sync_error": str(exc),
+                    }
+                },
+            )
+
     return {
-        "queued": n,
-        "message": "Sync accodato (worker IMAP da collegare). Seed demo con POST /api/dev/seed_demo",
+        "accounts_synced": synced,
+        "messages_inserted": inserted,
+        "errors": errors,
+        "message": "Sync IMAP completato"
+        if not errors
+        else "Sync completato con errori",
     }
 
 

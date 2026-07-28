@@ -47,7 +47,7 @@ export default function Compose() {
     }
     setSending(true);
     try {
-      const res = await api.sendMessage({
+      await api.sendMessage({
         email: userEmail,
         master_password: masterPassword,
         account_id: accountId,
@@ -57,7 +57,7 @@ export default function Compose() {
         as_pec: asPec || selected?.type === 'pec',
         reply_to_message_id: params.replyTo || null,
       });
-      Alert.alert('Inviato', res.message || 'In outbox');
+      Alert.alert('Inviato', 'Email inviata via SMTP');
       router.replace('/home');
     } catch (e: any) {
       Alert.alert('Errore', e.message);

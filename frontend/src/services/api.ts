@@ -12,7 +12,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error((data as any)?.detail || (data as any)?.message || res.statusText);
+    const detail = (data as any)?.detail;
+    let msg: string;
+    if (typeof detail === 'string') msg = detail;
+    else if (Array.isArray(detail))
+      msg = detail.map((d) => d?.msg || JSON.stringify(d)).join('; ');
+    else msg = (data as any)?.message || res.statusText || 'Errore';
+    throw new Error(msg);
   }
   return data as T;
 }
@@ -68,6 +74,11 @@ export const api = {
     req(`/api/accounts/${id}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`, {
       method: 'DELETE',
     }),
+  testAccount: (id: string, email: string, master_password: string) =>
+    req<{ ok: boolean; inbox_count?: number }>(
+      `/api/accounts/${id}/test?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+      { method: 'POST' },
+    ),
   listMessages: (params: {
     email: string;
     master_password: string;

@@ -45,7 +45,10 @@ export default function Home() {
     setRefreshing(true);
     try {
       if (userEmail && masterPassword) {
-        await api.syncRun(userEmail, masterPassword);
+        const res: any = await api.syncRun(userEmail, masterPassword);
+        if (res?.errors?.length) {
+          Alert.alert('Sync parziale', res.errors.join('\n'));
+        }
       }
       await load();
     } catch (e: any) {
@@ -124,7 +127,7 @@ export default function Home() {
         contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
         ListEmptyComponent={
           <Text style={styles.empty}>
-            Nessun messaggio. Aggiungi un account PEC/IMAP e premi + Demo per dati di prova.
+            Nessuna email. Aggiungi Gmail (App Password) o PEC in Account, poi scorri in basso per sincronizzare.
           </Text>
         }
         renderItem={({ item }) => (
