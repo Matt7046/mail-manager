@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter, HTTPException, Query, status
+from fastapi import FastAPI, APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
@@ -953,6 +953,7 @@ async def download_attachment(
     att_index: int,
     email: EmailStr,
     master_password: str,
+    filename: Optional[str] = None,
 ):
     """Scarica un allegato dal provider IMAP (on-demand)."""
     import asyncio
@@ -973,37 +974,43 @@ async def download_attachment(
     if not m:
         raise HTTPException(404, "Messaggio non trovato")
 
-    # Allegato salvato in chiaro (es. inviati dall'app) → download diretto
-    stored = m.get("attachments") or []
-    if (
-        0 <= att_index < len(stored)
-        and isinstance(stored[att_index], dict)
-        and stored[att_index].get("content_base64")
-    ):
-        import base64 as _b64
-
-        try:
-            raw = _b64.b64decode(stored[att_index]["content_base64"], validate=False)
-        except Exception as exc:
-            raise HTTPException(400, "Allegato corrotto in archivio") from exc
-        filename = stored[att_index].get("filename") or "allegato"
-        ctype = stored[att_index].get("content_type") or "application/octet-stream"
+    def _file_response(raw: bytes, fname: str, ctype: str):
         if not raw:
-            raise HTTPException(400, "Allegato vuoto in archivio")
-        safe_ascii = re.sub(r"[^\w.\-]+", "_", filename).strip("._") or "allegato"
+            raise HTTPException(400, "Allegato vuoto")
+        safe_ascii = re.sub(r"[^\w.\-]+", "_", fname).strip("._") or "allegato"
         disp = (
             f'attachment; filename="{safe_ascii}"; '
-            f"filename*=UTF-8''{quote(filename)}"
+            f"filename*=UTF-8''{quote(fname)}"
         )
         return Response(
             content=raw,
-            media_type=ctype.split(";")[0].strip() or "application/octet-stream",
+            media_type=(ctype or "application/octet-stream").split(";")[0].strip()
+            or "application/octet-stream",
             headers={
                 "Content-Disposition": disp,
                 "Cache-Control": "private, max-age=60",
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    # Allegato salvato in chiaro (es. inviati dall'app) → download diretto
+    stored = m.get("attachments") or []
+    if 0 <= att_index < len(stored) and isinstance(stored[att_index], dict):
+        b64 = (stored[att_index].get("content_base64") or "").strip()
+        if b64:
+            import base64 as _b64
+
+            try:
+                raw = _b64.b64decode(b64, validate=False)
+            except Exception:
+                raw = b""
+            if raw:
+                return _file_response(
+                    raw,
+                    stored[att_index].get("filename") or filename or "allegato",
+                    stored[att_index].get("content_type")
+                    or "application/octet-stream",
+                )
 
     imap_uid = (m.get("imap_uid") or "").strip()
     if not imap_uid:
@@ -1019,6 +1026,10 @@ async def download_attachment(
     if not acc:
         raise HTTPException(404, "Account non trovato")
 
+    want_name = (filename or "").strip() or None
+    if not want_name and 0 <= att_index < len(stored) and isinstance(stored[att_index], dict):
+        want_name = (stored[att_index].get("filename") or "").strip() or None
+
     try:
         user, pwd, access_token = await resolve_mailbox_creds(acc, email_l)
         att = await asyncio.to_thread(
@@ -1033,6 +1044,7 @@ async def download_attachment(
             account_type=acc.get("type") or "imap",
             provider_hint=acc.get("pec_provider") or acc.get("type"),
             access_token=access_token,
+            want_filename=want_name,
         )
     except HTTPException:
         raise
@@ -1040,25 +1052,10 @@ async def download_attachment(
         log.exception("Download allegato fallito msg=%s idx=%s", message_id, att_index)
         raise HTTPException(400, f"Download fallito: {exc}") from exc
 
-    filename = att.get("filename") or "allegato"
-    ctype = att.get("content_type") or "application/octet-stream"
-    raw = att.get("data") or b""
-    if not raw:
-        raise HTTPException(400, "Allegato vuoto sul server di posta")
-    # filename ASCII fallback + UTF-8 (Chrome/PWA)
-    safe_ascii = re.sub(r"[^\w.\-]+", "_", filename).strip("._") or "allegato"
-    disp = (
-        f'attachment; filename="{safe_ascii}"; '
-        f"filename*=UTF-8''{quote(filename)}"
-    )
-    return Response(
-        content=raw,
-        media_type=ctype.split(";")[0].strip() or "application/octet-stream",
-        headers={
-            "Content-Disposition": disp,
-            "Cache-Control": "private, max-age=60",
-            "X-Content-Type-Options": "nosniff",
-        },
+    return _file_response(
+        att.get("data") or b"",
+        att.get("filename") or want_name or "allegato",
+        att.get("content_type") or "application/octet-stream",
     )
 
 
@@ -1157,12 +1154,183 @@ async def set_flags(message_id: str, body: MessageFlagsBody):
     return {"ok": True}
 
 
+async def _deliver_and_store_sent(
+    *,
+    email: str,
+    account_id: str,
+    acc: dict,
+    to_addrs: List[str],
+    cc_addrs: List[str],
+    bcc_addrs: List[str],
+    subject: str,
+    body_text: str,
+    body_html: Optional[str],
+    as_pec: bool,
+    reply_to_message_id: Optional[str],
+    att_payload: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Invio SMTP + salvataggio in cartella Inviate / outbox."""
+    import asyncio
+    import base64 as _b64
+
+    smtp_host = acc.get("smtp_host") or acc.get("imap_host")
+    smtp_port = int(acc.get("smtp_port") or 465)
+    try:
+        smtp_user, smtp_pwd, access_token = await resolve_mailbox_creds(acc, email)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Credenziali SMTP non disponibili: {exc}") from exc
+
+    use_ssl = bool(acc.get("smtp_ssl", smtp_port == 465))
+    starttls = bool(acc.get("smtp_starttls", smtp_port == 587))
+    now = datetime.utcnow()
+
+    # Per SMTP preferisci i bytes grezzi; per Mongo salva anche base64
+    smtp_atts: List[Dict[str, Any]] = []
+    att_meta: List[Dict[str, Any]] = []
+    for a in att_payload:
+        raw = a.get("content_bytes")
+        raw_b64 = (a.get("content_base64") or "").strip()
+        if not isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = _b64.b64decode(raw_b64, validate=False)
+            except Exception as exc:
+                raise HTTPException(
+                    400, f"Allegato non valido ({a.get('filename')})"
+                ) from exc
+        raw = bytes(raw)
+        if not raw_b64:
+            raw_b64 = _b64.b64encode(raw).decode("ascii")
+        size = len(raw)
+        log.info(
+            "Send allegato name=%s size=%s b64_len=%s",
+            a.get("filename"),
+            size,
+            len(raw_b64),
+        )
+        smtp_atts.append(
+            {
+                "filename": a["filename"],
+                "content_type": a["content_type"],
+                "content_bytes": raw,
+                "content_base64": raw_b64,
+                "size": size,
+            }
+        )
+        att_meta.append(
+            {
+                "filename": a["filename"],
+                "content_type": a["content_type"],
+                "size": size,
+                "content_base64": raw_b64,
+            }
+        )
+
+    try:
+        await asyncio.to_thread(
+            mail_provider.send_smtp,
+            host=smtp_host,
+            port=smtp_port,
+            user=smtp_user,
+            password=smtp_pwd or "",
+            from_addr=acc["address"],
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            bcc_addrs=bcc_addrs,
+            subject=subject,
+            body_text=body_text or "",
+            body_html=body_html,
+            use_ssl=use_ssl,
+            starttls=starttls,
+            access_token=access_token,
+            attachments=smtp_atts,
+        )
+        send_status = "sent"
+        send_error = None
+    except Exception as exc:
+        log.exception("SMTP send failed")
+        send_status = "failed"
+        send_error = str(exc)
+
+    receipts = []
+    if as_pec or acc.get("type") == "pec":
+        receipts.append(
+            {
+                "type": "accettazione",
+                "at": now.isoformat() + "Z",
+                "status": "sent" if send_status == "sent" else "failed",
+                "note": send_error or "Inviata via SMTP PEC",
+            }
+        )
+
+    doc = {
+        "user_email": email,
+        "account_id": account_id,
+        "folder": "sent",
+        "subject": subject,
+        "from_addr": acc["address"],
+        "to_addrs": to_addrs,
+        "cc_addrs": cc_addrs,
+        "date": now,
+        "flags": {"seen": True, "flagged": False, "archived": False},
+        "has_attachments": bool(att_meta),
+        "attachments": att_meta,
+        "is_pec": bool(as_pec or acc.get("type") == "pec"),
+        "snippet": (body_text or "")[:160],
+        "body_enc": encrypt_secret(body_text or "", email),
+        "body_html": body_html,
+        "receipts": receipts,
+        "outbox_status": send_status,
+        "send_error": send_error,
+        "reply_to_message_id": reply_to_message_id,
+        "created_at": now,
+    }
+    res = await db.messages.insert_one(doc)
+    await db.outbox.insert_one(
+        {
+            "message_id": str(res.inserted_id),
+            "account_id": account_id,
+            "user_email": email,
+            "as_pec": bool(as_pec or acc.get("type") == "pec"),
+            "status": send_status,
+            "error": send_error,
+            "created_at": now,
+        }
+    )
+    if send_status != "sent":
+        raise HTTPException(400, f"Invio fallito: {send_error}")
+    return {
+        "id": str(res.inserted_id),
+        "queued": False,
+        "sent": True,
+        "is_pec": doc["is_pec"],
+        "receipts": receipts,
+        "message": "Messaggio inviato",
+        "attachment_sizes": [a["size"] for a in att_meta],
+    }
+
+
+def _norm_addrs(vals: List[str]) -> List[str]:
+    out: List[str] = []
+    for raw in vals:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        m = re.search(r"<([^>]+)>", s)
+        addr = (m.group(1) if m else s).strip().lower()
+        if "@" not in addr:
+            raise HTTPException(400, f"Destinatario non valido: {raw}")
+        out.append(addr)
+    return out
+
+
 @api.post("/messages/send")
 async def send_message(body: SendBody):
-    """Invio SMTP reale (Gmail app-password, Outlook, IMAP/PEC)."""
-    import asyncio
+    """Invio SMTP (JSON; allegati opzionali in base64)."""
     from bson import ObjectId
     from bson.errors import InvalidId
+    import base64 as _b64
 
     email = body.email.lower()
     await require_user(email, body.master_password)
@@ -1176,41 +1344,12 @@ async def send_message(body: SendBody):
     if body.as_pec and acc.get("type") != "pec":
         raise HTTPException(400, "as_pec richiede un account di tipo pec")
 
-    smtp_host = acc.get("smtp_host") or acc.get("imap_host")
-    smtp_port = int(acc.get("smtp_port") or 465)
-    try:
-        smtp_user, smtp_pwd, access_token = await resolve_mailbox_creds(acc, email)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, f"Credenziali SMTP non disponibili: {exc}") from exc
-
-    use_ssl = bool(acc.get("smtp_ssl", smtp_port == 465))
-    starttls = bool(acc.get("smtp_starttls", smtp_port == 587))
-
-    now = datetime.utcnow()
-
-    def _norm_addrs(vals: List[str]) -> List[str]:
-        out: List[str] = []
-        for raw in vals:
-            s = (raw or "").strip()
-            if not s:
-                continue
-            # Accetta "Nome <mail@x.it>" → mail@x.it
-            m = re.search(r"<([^>]+)>", s)
-            addr = (m.group(1) if m else s).strip().lower()
-            if "@" not in addr:
-                raise HTTPException(400, f"Destinatario non valido: {raw}")
-            out.append(addr)
-        return out
-
     to_addrs = _norm_addrs([str(x) for x in body.to])
     cc_addrs = _norm_addrs([str(x) for x in body.cc])
     bcc_addrs = _norm_addrs([str(x) for x in body.bcc])
     if not to_addrs:
         raise HTTPException(400, "Inserisci almeno un destinatario valido")
 
-    # Limiti allegati (base64 in JSON)
     MAX_ATT = 10
     MAX_ONE = 12 * 1024 * 1024
     MAX_ALL = 25 * 1024 * 1024
@@ -1218,7 +1357,6 @@ async def send_message(body: SendBody):
     total_raw = 0
     if len(body.attachments) > MAX_ATT:
         raise HTTPException(400, f"Massimo {MAX_ATT} allegati per messaggio")
-    import base64 as _b64
 
     for a in body.attachments:
         name = (a.filename or "allegato").strip() or "allegato"
@@ -1238,103 +1376,117 @@ async def send_message(body: SendBody):
             {
                 "filename": name,
                 "content_type": a.content_type or "application/octet-stream",
+                "content_bytes": raw,
                 "content_base64": raw_b64,
                 "size": len(raw),
             }
         )
 
-    try:
-        await asyncio.to_thread(
-            mail_provider.send_smtp,
-            host=smtp_host,
-            port=smtp_port,
-            user=smtp_user,
-            password=smtp_pwd or "",
-            from_addr=acc["address"],
-            to_addrs=to_addrs,
-            cc_addrs=cc_addrs,
-            bcc_addrs=bcc_addrs,
-            subject=body.subject,
-            body_text=body.body_text or "",
-            body_html=body.body_html,
-            use_ssl=use_ssl,
-            starttls=starttls,
-            access_token=access_token,
-            attachments=att_payload,
-        )
-        send_status = "sent"
-        send_error = None
-    except Exception as exc:
-        log.exception("SMTP send failed")
-        send_status = "failed"
-        send_error = str(exc)
+    return await _deliver_and_store_sent(
+        email=email,
+        account_id=body.account_id,
+        acc=acc,
+        to_addrs=to_addrs,
+        cc_addrs=cc_addrs,
+        bcc_addrs=bcc_addrs,
+        subject=body.subject,
+        body_text=body.body_text or "",
+        body_html=body.body_html,
+        as_pec=body.as_pec,
+        reply_to_message_id=body.reply_to_message_id,
+        att_payload=att_payload,
+    )
 
-    receipts = []
-    if body.as_pec or acc.get("type") == "pec":
-        receipts.append(
+
+@api.post("/messages/send-form")
+async def send_message_form(
+    email: str = Form(...),
+    master_password: str = Form(...),
+    account_id: str = Form(...),
+    to: str = Form(...),
+    subject: str = Form(""),
+    body_text: str = Form(""),
+    body_html: Optional[str] = Form(None),
+    as_pec: str = Form("false"),
+    reply_to_message_id: Optional[str] = Form(None),
+    cc: str = Form(""),
+    bcc: str = Form(""),
+    files: Optional[List[UploadFile]] = File(None),
+):
+    """Invio SMTP con allegati binari (multipart/form-data)."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    import base64 as _b64
+
+    email_l = email.lower().strip()
+    await require_user(email_l, master_password)
+    try:
+        oid = ObjectId(account_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "account_id non valido") from exc
+    acc = await db.accounts.find_one({"_id": oid, "user_email": email_l})
+    if not acc:
+        raise HTTPException(404, "Account non trovato")
+
+    as_pec_b = str(as_pec or "").strip().lower() in ("1", "true", "yes", "on")
+    if as_pec_b and acc.get("type") != "pec":
+        raise HTTPException(400, "as_pec richiede un account di tipo pec")
+
+    def _split_addrs(s: str) -> List[str]:
+        return [p.strip() for p in (s or "").replace(";", ",").split(",") if p.strip()]
+
+    to_addrs = _norm_addrs(_split_addrs(to))
+    cc_addrs = _norm_addrs(_split_addrs(cc))
+    bcc_addrs = _norm_addrs(_split_addrs(bcc))
+    if not to_addrs:
+        raise HTTPException(400, "Inserisci almeno un destinatario valido")
+
+    MAX_ATT = 10
+    MAX_ONE = 12 * 1024 * 1024
+    MAX_ALL = 25 * 1024 * 1024
+    upload_files = [f for f in (files or []) if f is not None]
+    if len(upload_files) > MAX_ATT:
+        raise HTTPException(400, f"Massimo {MAX_ATT} allegati per messaggio")
+
+    att_payload: List[Dict[str, Any]] = []
+    total_raw = 0
+    for uf in upload_files:
+        name = (uf.filename or "allegato").strip() or "allegato"
+        raw = await uf.read()
+        if not raw:
+            raise HTTPException(400, f"Allegato vuoto ({name})")
+        if len(raw) > MAX_ONE:
+            raise HTTPException(400, f"Allegato troppo grande ({name}): max 12 MB")
+        total_raw += len(raw)
+        if total_raw > MAX_ALL:
+            raise HTTPException(400, "Dimensione totale allegati oltre 25 MB")
+        ctype = (uf.content_type or "application/octet-stream").split(";")[0].strip()
+        att_payload.append(
             {
-                "type": "accettazione",
-                "at": now.isoformat() + "Z",
-                "status": "sent" if send_status == "sent" else "failed",
-                "note": send_error or "Inviata via SMTP PEC",
+                "filename": name,
+                "content_type": ctype or "application/octet-stream",
+                "content_bytes": raw,
+                "content_base64": _b64.b64encode(raw).decode("ascii"),
+                "size": len(raw),
             }
         )
+        log.info("Upload form allegato name=%s bytes=%s", name, len(raw))
 
-    att_meta = [
-        {
-            "filename": a["filename"],
-            "content_type": a["content_type"],
-            "size": a["size"],
-            # Consente download subito dopo invio (prima del sync IMAP)
-            "content_base64": a.get("content_base64") or "",
-        }
-        for a in att_payload
-    ]
-
-    doc = {
-        "user_email": email,
-        "account_id": body.account_id,
-        "folder": "sent",
-        "subject": body.subject,
-        "from_addr": acc["address"],
-        "to_addrs": to_addrs,
-        "cc_addrs": cc_addrs,
-        "date": now,
-        "flags": {"seen": True, "flagged": False, "archived": False},
-        "has_attachments": bool(att_meta),
-        "attachments": att_meta,
-        "is_pec": bool(body.as_pec or acc.get("type") == "pec"),
-        "snippet": (body.body_text or "")[:160],
-        "body_enc": encrypt_secret(body.body_text or "", email),
-        "body_html": body.body_html,
-        "receipts": receipts,
-        "outbox_status": send_status,
-        "send_error": send_error,
-        "reply_to_message_id": body.reply_to_message_id,
-        "created_at": now,
-    }
-    res = await db.messages.insert_one(doc)
-    await db.outbox.insert_one(
-        {
-            "message_id": str(res.inserted_id),
-            "account_id": body.account_id,
-            "user_email": email,
-            "as_pec": bool(body.as_pec or acc.get("type") == "pec"),
-            "status": send_status,
-            "error": send_error,
-            "created_at": now,
-        }
+    return await _deliver_and_store_sent(
+        email=email_l,
+        account_id=account_id,
+        acc=acc,
+        to_addrs=to_addrs,
+        cc_addrs=cc_addrs,
+        bcc_addrs=bcc_addrs,
+        subject=subject or "",
+        body_text=body_text or "",
+        body_html=body_html,
+        as_pec=as_pec_b,
+        reply_to_message_id=reply_to_message_id,
+        att_payload=att_payload,
     )
-    if send_status != "sent":
-        raise HTTPException(400, f"Invio fallito: {send_error}")
-    return {
-        "id": str(res.inserted_id),
-        "queued": False,
-        "sent": True,
-        "is_pec": doc["is_pec"],
-        "receipts": receipts,
-        "message": "Messaggio inviato",
-    }
+
 
 
 @api.get("/messages/{message_id}/export")

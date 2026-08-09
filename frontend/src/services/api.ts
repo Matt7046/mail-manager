@@ -6,6 +6,32 @@ const BASE =
 
 
 
+async function parseError(res: Response, rawText: string, data: any): Promise<never> {
+  if (res.status === 413) {
+    throw new Error(
+      'Allegato troppo grande per il server (limite upload). Riduci i file sotto ~18 MB totali.',
+    );
+  }
+  const detail = data?.detail;
+  let msg: string;
+  if (typeof detail === 'string') msg = detail;
+  else if (Array.isArray(detail)) {
+    msg = detail
+      .map((d: any) => {
+        const loc = Array.isArray(d?.loc)
+          ? d.loc.filter((x: any) => x !== 'body').join('.')
+          : '';
+        const m = d?.msg || JSON.stringify(d);
+        if (loc && /required/i.test(String(m))) {
+          return `Campo mancante: ${loc}`;
+        }
+        return loc ? `${loc}: ${m}` : m;
+      })
+      .join('; ');
+  } else msg = data?.message || rawText?.slice(0, 200) || res.statusText || 'Errore';
+  throw new Error(msg);
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
@@ -24,31 +50,28 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (!res.ok) {
-    if (res.status === 413) {
-      throw new Error(
-        'Allegato troppo grande per il server (limite upload). Riduci i file sotto ~18 MB totali.',
-      );
-    }
-    const detail = data?.detail;
-    let msg: string;
-    if (typeof detail === 'string') msg = detail;
-    else if (Array.isArray(detail)) {
-      msg = detail
-        .map((d: any) => {
-          const loc = Array.isArray(d?.loc)
-            ? d.loc.filter((x: any) => x !== 'body').join('.')
-            : '';
-          const m = d?.msg || JSON.stringify(d);
-          if (loc && /required/i.test(String(m))) {
-            return `Campo mancante: ${loc}`;
-          }
-          return loc ? `${loc}: ${m}` : m;
-        })
-        .join('; ');
-    } else msg = data?.message || rawText?.slice(0, 200) || res.statusText || 'Errore';
-    throw new Error(msg);
+    await parseError(res, rawText, data);
   }
 
+  return data as T;
+}
+
+/** POST multipart (non impostare Content-Type: il browser aggiunge il boundary). */
+async function reqForm<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    body: form,
+  });
+  const rawText = await res.text();
+  let data: any = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    data = {};
+  }
+  if (!res.ok) {
+    await parseError(res, rawText, data);
+  }
   return data as T;
 }
 
@@ -274,8 +297,15 @@ export const api = {
     index: number,
     email: string,
     master_password: string,
-  ) =>
-    `${BASE}/api/messages/${id}/attachments/${index}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
+    filename?: string,
+  ) => {
+    const sp = new URLSearchParams({
+      email,
+      master_password,
+    });
+    if (filename) sp.set('filename', filename);
+    return `${BASE}/api/messages/${id}/attachments/${index}?${sp.toString()}`;
+  },
 
   trashMessage: (id: string, email: string, master_password: string) =>
 
@@ -308,8 +338,10 @@ export const api = {
     ),
 
   sendMessage: (body: Record<string, unknown>) =>
-
     req<any>('/api/messages/send', { method: 'POST', body: JSON.stringify(body) }),
+
+  /** Invio con allegati binari (evita base64 JSON che può truncare i file). */
+  sendMessageForm: (form: FormData) => reqForm<any>('/api/messages/send-form', form),
 
   syncRun: (email: string, master_password: string) =>
 

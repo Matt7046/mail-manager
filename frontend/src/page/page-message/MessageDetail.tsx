@@ -155,7 +155,13 @@ export default function MessageDetail() {
     if (!id || !userEmail || !masterPassword || downloading !== null) return;
     setDownloading(index);
     try {
-      const url = api.attachmentDownloadUrl(id, index, userEmail, masterPassword);
+      const url = api.attachmentDownloadUrl(
+        id,
+        index,
+        userEmail,
+        masterPassword,
+        meta?.filename,
+      );
       const filename = meta?.filename || `allegato-${index + 1}`;
 
       if (Platform.OS !== 'web' || typeof document === 'undefined') {

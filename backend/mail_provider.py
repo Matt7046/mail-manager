@@ -670,35 +670,110 @@ def _parse_fetch_items(
     }
 
 
+def _part_payload_bytes(part: email.message.Message) -> bytes:
+    """Decodifica payload di una parte MIME (base64/qp/7bit/8bit)."""
+    try:
+        raw = part.get_payload(decode=True)
+        if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+            return bytes(raw)
+    except Exception:
+        pass
+
+    payload = part.get_payload(decode=False)
+    if isinstance(payload, (bytes, bytearray)) and payload:
+        return bytes(payload)
+    if isinstance(payload, list):
+        # contenitore multipart — non è un file foglia
+        return b""
+    if not isinstance(payload, str) or not payload.strip():
+        return b""
+
+    cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+    try:
+        if cte == "base64":
+            # rimuovi whitespace/newline tipici MIME
+            cleaned = re.sub(r"\s+", "", payload)
+            return b64mod.b64decode(cleaned, validate=False)
+        if cte in ("quoted-printable", "quopri"):
+            import quopri
+
+            return quopri.decodestring(payload.encode("utf-8", errors="replace"))
+        return payload.encode(part.get_content_charset() or "utf-8", errors="replace")
+    except Exception:
+        try:
+            return payload.encode("latin-1", errors="replace")
+        except Exception:
+            return b""
+
+
 def _iter_file_attachments(msg: email.message.Message) -> List[Dict[str, Any]]:
-    """Estrae allegati file (esclude inline CID senza disposition attachment)."""
+    """Estrae allegati file foglia (niente multipart container / inline CID)."""
     out: List[Dict[str, Any]] = []
-    if not msg.is_multipart():
-        return out
     for part in msg.walk():
+        # Solo parti foglia con contenuto
+        if part.is_multipart():
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        if ctype in ("text/plain", "text/html") and not part.get_filename():
+            # Corpo messaggio, non allegato (salvo se ha filename)
+            disp0 = str(part.get("Content-Disposition") or "").lower()
+            if "attachment" not in disp0:
+                continue
+
         disp = str(part.get("Content-Disposition") or "")
         filename = _decode_header(part.get_filename()) or ""
+        # name= nel Content-Type
+        if not filename:
+            try:
+                filename = _decode_header(part.get_param("name")) or ""
+            except Exception:
+                filename = ""
         cid = part.get("Content-ID") or part.get("Content-Id")
         is_att = "attachment" in disp.lower() or bool(filename)
         if not is_att:
             continue
-        if cid and "attachment" not in disp.lower():
+        if cid and "attachment" not in disp.lower() and "inline" in disp.lower():
             continue
-        try:
-            raw = part.get_payload(decode=True) or b""
-        except Exception:
-            raw = b""
-        if not isinstance(raw, (bytes, bytearray)):
-            raw = bytes(raw) if raw else b""
+        if cid and "attachment" not in disp.lower() and not filename:
+            continue
+
+        raw = _part_payload_bytes(part)
         out.append(
             {
                 "filename": filename or "allegato",
                 "content_type": part.get_content_type() or "application/octet-stream",
-                "data": bytes(raw),
+                "data": raw,
                 "size": len(raw),
             }
         )
-    return out
+    # Preferisci allegati con bytes; tieni gli altri in coda (per matching indice)
+    with_data = [a for a in out if a["data"]]
+    empty = [a for a in out if not a["data"]]
+    if with_data and empty:
+        log.info(
+            "Allegati: %s con dati, %s vuoti (nomi vuoti=%s)",
+            len(with_data),
+            len(empty),
+            [a["filename"] for a in empty],
+        )
+    return with_data if with_data else out
+
+
+def _imap_fetch_raw_message(client: imaplib.IMAP4, uid_s: str) -> bytes:
+    """FETCH messaggio completo (prova BODY.PEEK[] poi RFC822)."""
+    for spec in ("(BODY.PEEK[])", "(RFC822)"):
+        typ, msg_data = client.uid("FETCH", uid_s, spec)
+        if typ != "OK" or not msg_data:
+            continue
+        best = b""
+        for item in msg_data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                body_part = item[1]
+                if isinstance(body_part, (bytes, bytearray)) and len(body_part) > len(best):
+                    best = bytes(body_part)
+        if len(best) > 10:
+            return best
+    raise RuntimeError("Corpo messaggio vuoto su IMAP")
 
 
 def fetch_attachment(
@@ -713,6 +788,7 @@ def fetch_attachment(
     account_type: str = "imap",
     provider_hint: Optional[str] = None,
     access_token: Optional[str] = None,
+    want_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Scarica un allegato dal provider IMAP (per UID + indice 0-based).
@@ -738,19 +814,15 @@ def fetch_attachment(
     )
     try:
         folder_l = (folder or "INBOX").lower()
-        if use_gmraw or (is_gmail and folder_l == "sent"):
-            # Preferisci mailbox corretta
-            if use_gmraw:
-                box = _resolve_gmail_all_mail(client)
-                if not box:
-                    raise RuntimeError("Gmail All Mail non disponibile")
-            else:
-                box = resolve_sent_mailbox(client)
-                if not box:
-                    raise RuntimeError("Cartella Inviate non trovata")
+        if use_gmraw:
+            box = _resolve_gmail_all_mail(client)
+            if not box:
+                raise RuntimeError("Gmail All Mail non disponibile")
             typ, _ = client.select(_quote_mailbox(box), readonly=True)
         elif folder_l == "sent":
             box = resolve_sent_mailbox(client)
+            if not box and is_gmail:
+                box = _resolve_gmail_all_mail(client)
             if not box:
                 raise RuntimeError("Cartella Inviate non trovata")
             typ, _ = client.select(_quote_mailbox(box), readonly=True)
@@ -759,32 +831,36 @@ def fetch_attachment(
         if typ != "OK":
             raise RuntimeError("Impossibile aprire la mailbox per l'allegato")
 
-        typ, msg_data = client.uid("FETCH", uid_s, "(BODY.PEEK[])")
-        if typ != "OK" or not msg_data:
-            raise RuntimeError("Messaggio non trovato su IMAP")
-        raw = None
-        for item in msg_data:
-            if isinstance(item, tuple) and len(item) >= 2:
-                body_part = item[1]
-                if isinstance(body_part, (bytes, bytearray)) and len(body_part) > 10:
-                    raw = body_part
-                    break
-        if not raw:
-            raise RuntimeError("Corpo messaggio vuoto su IMAP")
+        raw = _imap_fetch_raw_message(client, uid_s)
         msg = email.message_from_bytes(raw)
         atts = _iter_file_attachments(msg)
         if not atts:
             raise RuntimeError("Nessun allegato nel messaggio IMAP")
-        # Match per nome se l'indice non coincide (metadati sync vs parti reali)
+
         chosen = None
-        if 0 <= index < len(atts):
+        # 1) match per nome file richiesto
+        if want_filename:
+            want_l = want_filename.strip().lower()
+            for a in atts:
+                if (a.get("filename") or "").strip().lower() == want_l and a.get("data"):
+                    chosen = a
+                    break
+        # 2) indice
+        if chosen is None and 0 <= index < len(atts):
             chosen = atts[index]
-        if chosen is None:
-            raise RuntimeError(
-                f"Allegato #{index + 1} non trovato (disponibili: {len(atts)})"
+        # 3) primo con dati
+        if chosen is None or not chosen.get("data"):
+            for a in atts:
+                if a.get("data"):
+                    chosen = a
+                    break
+        if chosen is None or not chosen.get("data"):
+            names = ", ".join(
+                f"{a.get('filename')}({a.get('size')}B)" for a in atts
             )
-        if not chosen.get("data"):
-            raise RuntimeError(f"Allegato «{chosen.get('filename')}» vuoto")
+            raise RuntimeError(
+                f"Allegato vuoto o non trovato (indice {index + 1}). Trovati: {names}"
+            )
         return chosen
     finally:
         try:
@@ -1221,11 +1297,17 @@ def send_smtp(
     for att in attachments:
         filename = (att.get("filename") or "allegato").strip() or "allegato"
         ctype = (att.get("content_type") or "application/octet-stream").strip()
-        raw_b64 = att.get("content_base64") or ""
-        try:
-            raw = b64mod.b64decode(raw_b64, validate=False)
-        except Exception as exc:
-            raise ValueError(f"Allegato non valido ({filename}): {exc}") from exc
+        raw = att.get("content_bytes")
+        if not isinstance(raw, (bytes, bytearray)):
+            raw_b64 = att.get("content_base64") or ""
+            try:
+                raw = b64mod.b64decode(raw_b64, validate=False)
+            except Exception as exc:
+                raise ValueError(f"Allegato non valido ({filename}): {exc}") from exc
+        raw = bytes(raw)
+        if not raw:
+            raise ValueError(f"Allegato vuoto ({filename})")
+        log.info("SMTP allegato name=%s bytes=%s ctype=%s", filename, len(raw), ctype)
         if "/" in ctype:
             maintype, subtype = ctype.split("/", 1)
         else:
@@ -1236,7 +1318,8 @@ def send_smtp(
         part.add_header("Content-Disposition", "attachment", filename=filename)
         root.attach(part)
 
-    payload = root.as_string()
+    # as_bytes evita problemi di encoding su payload grandi rispetto a as_string()
+    payload = root.as_bytes()
 
     ctx = ssl.create_default_context()
     pwd = normalize_mailbox_secret(password)

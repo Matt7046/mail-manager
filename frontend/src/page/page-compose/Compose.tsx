@@ -18,8 +18,9 @@ type PendingAttachment = {
   id: string;
   filename: string;
   content_type: string;
-  content_base64: string;
   size: number;
+  /** File originale (web) — inviato in multipart senza base64. */
+  file: File;
 };
 
 const MAX_FILES = 10;
@@ -40,23 +41,26 @@ function feedback(title: string, message: string) {
   }
 }
 
-function readFileAsAttachment(file: File): Promise<PendingAttachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error(`Lettura fallita: ${file.name}`));
-    reader.onload = () => {
-      const result = String(reader.result || '');
-      const base64 = result.includes(',') ? result.split(',', 1)[1] : result;
-      resolve({
-        id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`,
-        filename: file.name || 'allegato',
-        content_type: file.type || 'application/octet-stream',
-        content_base64: base64,
-        size: file.size,
-      });
-    };
-    reader.readAsDataURL(file);
-  });
+async function fileToPending(file: File): Promise<PendingAttachment> {
+  // Verifica che il browser abbia i byte completi (non un preview ~8KB)
+  const buf = await file.arrayBuffer();
+  if (buf.byteLength !== file.size) {
+    throw new Error(
+      `Lettura incompleta di «${file.name}»: ${buf.byteLength} / ${file.size} byte`,
+    );
+  }
+  if (file.size > 0 && buf.byteLength < 64 && /\.(jpe?g|png|gif|webp|heic)$/i.test(file.name)) {
+    throw new Error(
+      `«${file.name}» sembra troppo piccolo (${formatSize(file.size)}) per un’immagine. Riprova a selezionare il file originale.`,
+    );
+  }
+  return {
+    id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`,
+    filename: file.name || 'allegato',
+    content_type: file.type || 'application/octet-stream',
+    size: file.size,
+    file,
+  };
 }
 
 export default function Compose() {
@@ -107,7 +111,7 @@ export default function Compose() {
           feedback('Allegati', 'Dimensione totale oltre 25 MB.');
           return;
         }
-        next.push(await readFileAsAttachment(file));
+        next.push(await fileToPending(file));
       }
       setAttachments((prev) => [...prev, ...next]);
     } catch (e: any) {
@@ -167,21 +171,36 @@ export default function Compose() {
     }
     setSending(true);
     try {
-      await api.sendMessage({
-        email: userEmail,
-        master_password: masterPassword,
-        account_id: accountId,
-        to: to.split(',').map((s) => s.trim()).filter(Boolean),
-        subject,
-        body_text: body,
-        as_pec: asPec || selected?.type === 'pec',
-        reply_to_message_id: params.replyTo || null,
-        attachments: attachments.map((a) => ({
-          filename: (a.filename || 'allegato').trim() || 'allegato',
-          content_type: a.content_type || 'application/octet-stream',
-          content_base64: a.content_base64 || '',
-        })),
-      });
+      if (attachments.length > 0) {
+        // Multipart binario: evita JSON+base64 (troncamenti / overhead)
+        const form = new FormData();
+        form.append('email', userEmail);
+        form.append('master_password', masterPassword);
+        form.append('account_id', accountId);
+        form.append('to', to);
+        form.append('subject', subject);
+        form.append('body_text', body);
+        form.append('as_pec', String(asPec || selected?.type === 'pec'));
+        if (params.replyTo) {
+          form.append('reply_to_message_id', String(params.replyTo));
+        }
+        for (const a of attachments) {
+          form.append('files', a.file, a.filename);
+        }
+        await api.sendMessageForm(form);
+      } else {
+        await api.sendMessage({
+          email: userEmail,
+          master_password: masterPassword,
+          account_id: accountId,
+          to: to.split(',').map((s) => s.trim()).filter(Boolean),
+          subject,
+          body_text: body,
+          as_pec: asPec || selected?.type === 'pec',
+          reply_to_message_id: params.replyTo || null,
+          attachments: [],
+        });
+      }
       feedback(
         'Inviato',
         attachments.length
