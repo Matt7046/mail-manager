@@ -8,6 +8,7 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -759,7 +760,8 @@ async def list_messages(
     email_l = email.lower()
     filt: Dict[str, Any] = {"user_email": email_l}
     if account:
-        filt["account_id"] = account
+        # Sempre stringa: evita mismatch ObjectId vs str che faceva fallire il filtro account
+        filt["account_id"] = str(account)
     folder_l = (folder or "inbox").lower()
     if folder_l == "trash":
         filt["folder"] = "trash"
@@ -769,9 +771,20 @@ async def list_messages(
         # Ricevute (inbox): escludi cestino e inviate (legacy senza folder = inbox)
         filt["folder"] = {"$nin": ["trash", "sent"]}
     if unread is True:
-        filt["flags.seen"] = False
+        # Non lette: seen=false OPPURE flag assente (messaggi syncati senza seen)
+        and_clauses_unread = {
+            "$or": [
+                {"flags.seen": False},
+                {"flags.seen": {"$exists": False}},
+                {"flags": {"$exists": False}},
+            ]
+        }
+    else:
+        and_clauses_unread = None
 
     and_clauses: List[Dict[str, Any]] = []
+    if and_clauses_unread:
+        and_clauses.append(and_clauses_unread)
 
     # Account PEC: servono per filtro e badge (query leggera su accounts)
     pec_acc_ids: List[str] = [
@@ -830,15 +843,18 @@ async def list_messages(
         is_pec = bool(raw_pec in (True, 1, "1", "true")) or (
             str(m.get("account_id") or "") in pec_acc_set
         )
+        flags = dict(m.get("flags") or {})
+        seen_val = flags.get("seen")
+        flags["seen"] = seen_val is True or seen_val in (1, "1", "true", "True")
         items.append(
             {
                 "id": str(m["_id"]),
-                "account_id": m["account_id"],
+                "account_id": str(m.get("account_id") or ""),
                 "subject": m.get("subject", ""),
                 "from": m.get("from_addr", ""),
                 "to": m.get("to_addrs", []),
                 "date": m.get("date"),
-                "flags": m.get("flags", {}),
+                "flags": flags,
                 "has_attachments": m.get("has_attachments", False),
                 "is_pec": is_pec,
                 "snippet": m.get("snippet", ""),
@@ -862,12 +878,43 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
     m = await db.messages.find_one({"_id": oid, "user_email": email.lower()})
     if not m:
         raise HTTPException(404, "Messaggio non trovato")
+    # Apertura messaggio → segna come letta
+    flags = m.get("flags") or {}
+    if flags.get("seen") is not True:
+        await db.messages.update_one(
+            {"_id": oid},
+            {"$set": {"flags.seen": True, "updated_at": datetime.utcnow()}},
+        )
+        flags = {**flags, "seen": True}
     body = m.get("body_text", "")
     if m.get("body_enc"):
         try:
             body = decrypt_secret(m["body_enc"], email.lower())
         except Exception:
             body = m.get("body_text", "")
+    # Pulisci &zwnj; / zero-width anche su messaggi già syncati
+    body = mail_provider._clean_text(body or "")
+    html_body = m.get("body_html") or ""
+    if html_body and (not body or len(body) < 40):
+        derived = mail_provider._html_to_text(html_body)
+        if derived:
+            body = derived
+    # Sostituisci cid: → data: per immagini inline
+    inline_parts = m.get("inline_parts") or []
+    if html_body and inline_parts:
+        for part in inline_parts:
+            cid = (part.get("cid") or "").strip()
+            if not cid:
+                continue
+            data_url = (
+                f"data:{part.get('content_type') or 'image/png'};base64,"
+                f"{part.get('content_base64') or ''}"
+            )
+            html_body = re.sub(
+                rf"(?i)cid:<?{re.escape(cid)}?>?",
+                data_url,
+                html_body,
+            )
     return {
         "id": str(m["_id"]),
         "account_id": m["account_id"],
@@ -876,12 +923,12 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
         "to": m.get("to_addrs", []),
         "cc": m.get("cc_addrs", []),
         "date": m.get("date"),
-        "flags": m.get("flags", {}),
+        "flags": flags,
         "has_attachments": m.get("has_attachments", False),
         "attachments": m.get("attachments", []),
         "is_pec": m.get("is_pec", False),
         "body_text": body,
-        "body_html": m.get("body_html"),
+        "body_html": html_body or None,
         "receipts": m.get("receipts", []),
         "priority": m.get("priority"),
         "folder": m.get("folder") or "INBOX",
@@ -1279,6 +1326,10 @@ async def sync_accounts_for_user(
                     if existing and (existing.get("folder") or "").lower() == "trash":
                         # non riportare in inbox messaggi già nel cestino
                         folder = "trash"
+                # Non azzerare "letto in app" se IMAP non riporta ancora \Seen
+                imap_flags = dict(m.get("flags") or {})
+                if existing and (existing.get("flags") or {}).get("seen") is True:
+                    imap_flags["seen"] = True
                 payload = {
                     **lookup,
                     "folder": folder,
@@ -1288,9 +1339,10 @@ async def sync_accounts_for_user(
                     "to_addrs": m.get("to_addrs", []),
                     "cc_addrs": m.get("cc_addrs", []),
                     "date": m.get("date") or datetime.utcnow(),
-                    "flags": m.get("flags", {}),
+                    "flags": imap_flags,
                     "has_attachments": m.get("has_attachments", False),
                     "attachments": m.get("attachments", []),
+                    "inline_parts": m.get("inline_parts") or [],
                     "is_pec": m.get("is_pec", False),
                     "snippet": m.get("snippet", ""),
                     "body_enc": encrypt_secret(m.get("body_text") or "", email_l),

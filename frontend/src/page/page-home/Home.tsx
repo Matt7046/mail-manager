@@ -409,7 +409,10 @@ export default function Home() {
               'select',
               {
                 value: accountId,
-                onChange: (e: any) => setAccountId(e.target.value || ''),
+                onChange: (e: any) => {
+                  const v = String(e?.target?.value ?? '');
+                  setAccountId(v);
+                },
                 style: {
                   width: '100%',
                   padding: 12,
@@ -513,28 +516,51 @@ export default function Home() {
           renderItem={({ item }) => {
             const isSent =
               folder === 'sent' || (item.folder || '').toLowerCase() === 'sent';
+            const seenFlag = item.flags?.seen;
+            const isUnread =
+              !isSent &&
+              !(seenFlag === true || seenFlag === 1 || seenFlag === '1' || seenFlag === 'true');
             const peer = isSent
               ? (item.to?.length ? item.to.join(', ') : '—')
               : item.from;
             return (
             <TouchableOpacity
-              style={[styles.card, !item.flags?.seen && !isSent && styles.cardUnread]}
-              onPress={() => router.push({ pathname: '/message', params: { id: item.id } })}
+              style={[styles.card, isUnread && styles.cardUnread]}
+              onPress={() => {
+                // Optimistic: togli NEW subito (il GET messaggio conferma sul server)
+                if (isUnread) {
+                  setItems((prev) =>
+                    prev.map((x) =>
+                      x.id === item.id
+                        ? { ...x, flags: { ...(x.flags || {}), seen: true } }
+                        : x,
+                    ),
+                  );
+                }
+                router.push({ pathname: '/message', params: { id: item.id } });
+              }}
             >
               <View style={styles.cardTop}>
-                <Text style={styles.from} numberOfLines={1}>
+                <Text style={[styles.from, isUnread && styles.fromUnread]} numberOfLines={1}>
                   {isSent ? `A: ${peer}` : peer}
                 </Text>
-                {item.is_pec ? (
-                  <View style={styles.pecBadge}>
-                    <Text style={styles.pecText}>PEC</Text>
-                  </View>
-                ) : null}
+                <View style={styles.badges}>
+                  {isUnread ? (
+                    <View style={styles.newBadge}>
+                      <Text style={styles.newText}>NEW</Text>
+                    </View>
+                  ) : null}
+                  {item.is_pec ? (
+                    <View style={styles.pecBadge}>
+                      <Text style={styles.pecText}>PEC</Text>
+                    </View>
+                  ) : null}
+                </View>
               </View>
-              <Text style={styles.subject} numberOfLines={1}>
+              <Text style={[styles.subject, isUnread && styles.subjectUnread]} numberOfLines={1}>
                 {item.subject || '(senza oggetto)'}
               </Text>
-              <Text style={styles.snippet} numberOfLines={2}>
+              <Text style={[styles.snippet, isUnread && styles.snippetUnread]} numberOfLines={2}>
                 {item.snippet}
               </Text>
             </TouchableOpacity>
@@ -617,9 +643,22 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 10,
   },
-  cardUnread: { borderLeftWidth: 3, borderLeftColor: '#4ecdc4' },
-  cardTop: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
-  from: { color: '#fff', fontWeight: '600', flex: 1 },
+  cardUnread: {
+    backgroundColor: '#1c3558',
+    borderLeftWidth: 4,
+    borderLeftColor: '#4ecdc4',
+  },
+  cardTop: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, alignItems: 'center' },
+  badges: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 },
+  from: { color: '#c5cdd8', fontWeight: '600', flex: 1 },
+  fromUnread: { color: '#fff', fontWeight: '800' },
+  newBadge: {
+    backgroundColor: '#4ecdc4',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  newText: { color: '#0b1220', fontSize: 11, fontWeight: '800', letterSpacing: 0.3 },
   pecBadge: {
     backgroundColor: '#e040a0',
     borderRadius: 6,
@@ -627,6 +666,8 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   pecText: { color: '#fff', fontSize: 11, fontWeight: '700' },
-  subject: { color: '#ddd', marginTop: 4 },
-  snippet: { color: '#888', marginTop: 4, fontSize: 13 },
+  subject: { color: '#9aa3b2', marginTop: 4 },
+  subjectUnread: { color: '#fff', fontWeight: '700' },
+  snippet: { color: '#666', marginTop: 4, fontSize: 13 },
+  snippetUnread: { color: '#a8b4c4' },
 });
