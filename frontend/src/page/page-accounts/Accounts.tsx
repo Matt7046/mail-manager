@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -81,7 +81,7 @@ function providerFromAccount(a: Account): Provider {
 }
 
 export default function Accounts() {
-  const { userEmail, masterPassword } = useAuth();
+  const { userEmail, masterPassword, isReady } = useAuth();
   const router = useRouter();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -93,6 +93,13 @@ export default function Accounts() {
   const [customHost, setCustomHost] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+
+  useEffect(() => {
+    if (!isReady) return;
+    if (!userEmail || !masterPassword) {
+      router.replace('/login');
+    }
+  }, [isReady, userEmail, masterPassword, router]);
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;

@@ -1,4 +1,4 @@
-const CACHE = "mail-manager-v4";
+const CACHE = "mail-manager-v7";
 const PRECACHE = [
   "/",
   "/manifest.webmanifest",
@@ -43,39 +43,82 @@ self.addEventListener("fetch", (event) => {
   );
 });
 
-self.addEventListener("push", (event) => {
-  let data = { title: "Mail Manager", body: "Nuova email", url: "/home", tag: "new-mail" };
+function absUrl(path) {
   try {
-    if (event.data) data = { ...data, ...event.data.json() };
+    return new URL(path || "/", self.location.origin).href;
+  } catch (_) {
+    return path || "/";
+  }
+}
+
+self.addEventListener("push", (event) => {
+  // Chrome/Android richiedono sempre una notifica visibile nel push handler
+  // (userVisibleOnly). Deve funzionare anche a app/PWA chiusa.
+  const fallback = {
+    title: "Mail Manager",
+    body: "Nuova email",
+    // `/` → Index ripristina la sessione vault e reindirizza a /home o /login
+    url: "/",
+    tag: "new-mail",
+  };
+  let data = { ...fallback };
+  try {
+    if (event.data) {
+      const parsed = event.data.json();
+      if (parsed && typeof parsed === "object") data = { ...fallback, ...parsed };
+    }
   } catch (_) {
     try {
-      data.body = event.data ? event.data.text() : data.body;
+      const text = event.data ? event.data.text() : "";
+      if (text) data.body = text;
     } catch (_) {}
   }
+
+  const title = data.title || fallback.title;
+  // Preferisci `/` rispetto a `/home` a freddo: evita inbox vuota senza vault unlock
+  let path = data.url || fallback.url;
+  if (path === "/home" || path === "/home/") path = "/";
+  const options = {
+    body: data.body || fallback.body,
+    icon: absUrl("/pwa/icon-192.png"),
+    badge: absUrl("/favicon.png"),
+    tag: data.tag || fallback.tag,
+    renotify: true,
+    vibrate: [120, 60, 120],
+    data: { url: path },
+  };
+
   event.waitUntil(
-    self.registration.showNotification(data.title || "Mail Manager", {
-      body: data.body || "Nuova email",
-      icon: "/pwa/icon-192.png",
-      badge: "/favicon.png",
-      tag: data.tag || "new-mail",
-      renotify: true,
-      data: { url: data.url || "/home" },
+    self.registration.showNotification(title, options).catch((err) => {
+      console.error("[sw] showNotification failed", err);
     }),
   );
 });
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || "/home";
+  // Non fare client.navigate(): remounta la SPA e azzerava il vault in memoria
+  // (inbox vuota / "account non collegati"). Focus client esistente + postMessage;
+  // altrimenti openWindow("/") — AuthContext ripristina la sessione da storage.
+  const target = absUrl("/");
+
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
-      for (const c of clients) {
-        if ("focus" in c) {
-          try {
-            if (typeof c.navigate === "function") c.navigate(target);
-          } catch (_) {}
-          return c.focus();
-        }
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        try {
+          const origin = new URL(client.url).origin;
+          if (origin === self.location.origin && "focus" in client) {
+            return client.focus().then((focused) => {
+              try {
+                (focused || client).postMessage({
+                  type: "NOTIFICATION_CLICK",
+                  url: "/home",
+                });
+              } catch (_) {}
+              return focused || client;
+            });
+          }
+        } catch (_) {}
       }
       if (self.clients.openWindow) return self.clients.openWindow(target);
     }),

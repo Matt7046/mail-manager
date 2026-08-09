@@ -34,7 +34,7 @@ function feedback(title: string, message: string) {
 }
 
 export default function Home() {
-  const { userEmail, masterPassword, logout, enableNotifications } = useAuth();
+  const { userEmail, masterPassword, isReady, logout, enableNotifications } = useAuth();
   const router = useRouter();
   const [items, setItems] = useState<MessageListItem[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -46,6 +46,14 @@ export default function Home() {
   const [pushHint, setPushHint] = useState<{ ok: boolean; text: string } | null>(null);
   const [pushBusy, setPushBusy] = useState(false);
   const lastCount = useRef(0);
+
+  // Evita inbox vuota / "account non collegati" se si apre /home senza vault sbloccato
+  useEffect(() => {
+    if (!isReady) return;
+    if (!userEmail || !masterPassword) {
+      router.replace('/login');
+    }
+  }, [isReady, userEmail, masterPassword, router]);
 
   const loadAccounts = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
@@ -77,20 +85,8 @@ export default function Home() {
         const n = res?.messages_inserted ?? 0;
         if (n > 0) {
           setSyncHint(`${n} nuov${n === 1 ? 'a' : 'e'} email sincronizzat${n === 1 ? 'a' : 'e'}`);
-          if (
-            !silent &&
-            Platform.OS === 'web' &&
-            typeof Notification !== 'undefined' &&
-            Notification.permission === 'granted'
-          ) {
-            try {
-              new Notification(n === 1 ? 'Nuova email' : `${n} nuove email`, {
-                body: 'Inbox aggiornata',
-                icon: '/pwa/icon-192.png',
-                tag: 'new-mail-local',
-              });
-            } catch (_) {}
-          }
+          // Non usare Notification API in-page: le push devono arrivare dal server
+          // (Web Push → SW) anche a app chiusa. La notifica locale confondeva il test Android.
         } else if (!silent) {
           setSyncHint('Inbox aggiornata');
         }
@@ -147,6 +143,14 @@ export default function Home() {
       setPushBusy(false);
     }
   };
+
+  if (!isReady || !userEmail || !masterPassword) {
+    return (
+      <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
+        <Text style={{ color: '#888' }}>Caricamento…</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -258,9 +262,13 @@ export default function Home() {
         contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
         ListEmptyComponent={
           <Text style={styles.empty}>
-            {filter === 'trash'
-              ? 'Cestino vuoto.'
-              : 'Nessuna email. Aggiungi una casella in Account: la sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
+            {!userEmail || !masterPassword
+              ? 'Sessione non attiva. Reindirizzamento al login…'
+              : filter === 'trash'
+                ? 'Cestino vuoto.'
+                : accounts.length === 0
+                  ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
+                  : 'Nessuna email. La sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
           </Text>
         }
         renderItem={({ item }) => (

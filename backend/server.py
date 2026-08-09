@@ -1254,10 +1254,35 @@ async def sync_accounts_for_user(
     }
 
 
+async def _load_push_subs(email_l: str) -> List[Dict[str, Any]]:
+    subs: List[Dict[str, Any]] = []
+    async for s in db.push_subscriptions.find({"user_email": email_l}):
+        subs.append(
+            {
+                "endpoint": s["endpoint"],
+                "keys": s.get("keys") or {},
+            }
+        )
+    return subs
+
+
+async def _purge_dead_push_subs(email_l: str, dead: List[str]) -> int:
+    if not dead:
+        return 0
+    res = await db.push_subscriptions.delete_many(
+        {"user_email": email_l, "endpoint": {"$in": dead}}
+    )
+    removed = int(res.deleted_count or 0)
+    if removed:
+        log.info("Push: rimosse %s subscription scadute per %s", removed, email_l)
+    return removed
+
+
 async def notify_user_new_mail(
     email_l: str, inserted: int, previews: List[Dict[str, str]]
 ) -> None:
     if not push_notify.vapid_configured():
+        log.warning("Push nuova mail saltata: VAPID non configurato (%s)", email_l)
         return
     first = previews[0] if previews else {}
     pec = first.get("is_pec") == "1"
@@ -1270,23 +1295,23 @@ async def notify_user_new_mail(
     if first.get("account"):
         body = f"[{first['account']}] {body}"
 
-    subs = []
-    async for s in db.push_subscriptions.find({"user_email": email_l}):
-        subs.append(
-            {
-                "endpoint": s["endpoint"],
-                "keys": s.get("keys") or {},
-            }
-        )
+    subs = await _load_push_subs(email_l)
     if not subs:
+        log.info("Push nuova mail: nessuna subscription per %s (+%s)", email_l, inserted)
         return
-    dead = push_notify.notify_new_mail(
-        subs, title=title, body=body[:180], url="/home", tag="new-mail"
+    dead, ok, fail = push_notify.notify_new_mail(
+        subs, title=title, body=body[:180], url="/", tag="new-mail"
     )
-    if dead:
-        await db.push_subscriptions.delete_many(
-            {"user_email": email_l, "endpoint": {"$in": dead}}
-        )
+    await _purge_dead_push_subs(email_l, dead)
+    log.info(
+        "Push nuova mail user=%s inserted=%s subs=%s ok=%s fail=%s dead=%s",
+        email_l,
+        inserted,
+        len(subs),
+        ok,
+        fail,
+        len(dead),
+    )
 
 
 @api.post("/sync/run")
@@ -1334,6 +1359,13 @@ async def push_subscribe(body: PushSubscribeBody):
     await require_user(email, body.master_password)
     if not body.endpoint or not body.keys.get("p256dh") or not body.keys.get("auth"):
         raise HTTPException(400, "Subscription incompleta")
+    host = ""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(body.endpoint).netloc
+    except Exception:
+        host = ""
     await db.push_subscriptions.update_one(
         {"user_email": email, "endpoint": body.endpoint},
         {
@@ -1346,12 +1378,51 @@ async def push_subscribe(body: PushSubscribeBody):
                 },
                 "expiration_time": body.expiration_time,
                 "updated_at": datetime.utcnow(),
+                "endpoint_host": host,
             },
             "$setOnInsert": {"created_at": datetime.utcnow()},
         },
         upsert=True,
     )
-    return {"ok": True}
+    log.info("Push subscribe user=%s host=%s", email, host or "?")
+    return {"ok": True, "endpoint_host": host}
+
+
+class PushTestBody(BaseModel):
+    email: EmailStr
+    master_password: str
+
+
+@api.post("/push/test")
+async def push_test(body: PushTestBody):
+    """Invia una notifica di prova a tutte le subscription dell'utente (debug Android)."""
+    email = body.email.lower()
+    await require_user(email, body.master_password)
+    if not push_notify.vapid_configured():
+        raise HTTPException(503, "Web Push non configurato")
+    subs = await _load_push_subs(email)
+    if not subs:
+        raise HTTPException(404, "Nessuna subscription push salvata. Tocca Notifiche e riprova.")
+    dead, ok, fail = push_notify.notify_new_mail(
+        subs,
+        title="Mail Manager",
+        body="Notifica di prova — se la vedi a app chiusa, il push funziona.",
+        url="/",
+        tag="push-test",
+    )
+    await _purge_dead_push_subs(email, dead)
+    return {
+        "ok": ok > 0,
+        "sent_ok": ok,
+        "sent_fail": fail,
+        "removed_expired": len(dead),
+        "subscriptions": len(subs),
+        "message": (
+            "Notifica di prova inviata."
+            if ok > 0
+            else "Invio fallito (subscription scadute o errore FCM). Ritocca Notifiche."
+        ),
+    }
 
 
 @api.delete("/push/subscribe")

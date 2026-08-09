@@ -5,10 +5,11 @@ import { useAuth } from '@/src/contexts/AuthContext';
 import { oauthCallbackPathFromQuery } from '@/src/lib/oauthStrayRedirect';
 
 export default function Index() {
-  const { masterPassword, bootstrap } = useAuth();
+  const { masterPassword, bootstrap, isReady } = useAuth();
   const [target, setTarget] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!isReady) return;
     (async () => {
       const oauthPath = oauthCallbackPathFromQuery();
       if (oauthPath) {
@@ -23,7 +24,7 @@ export default function Index() {
       // Always show login (Accedi + Crea nuovo account) — never force setup alone.
       setTarget('/login');
     })().catch(() => setTarget('/login'));
-  }, [masterPassword, bootstrap]);
+  }, [masterPassword, bootstrap, isReady]);
 
   if (!target) {
     return (

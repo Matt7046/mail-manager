@@ -5,8 +5,14 @@ import { api } from '@/src/services/api';
 import {
   enablePushNotifications,
   registerServiceWorker,
+  sendPushTestOnce,
   type PushEnableResult,
 } from '@/src/services/push';
+import {
+  clearVaultSession,
+  readVaultSession,
+  writeVaultSession,
+} from '@/src/lib/vaultSession';
 
 type AuthCtx = {
   userEmail: string | null;
@@ -28,9 +34,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
-    if (Platform.OS === 'web') {
-      registerServiceWorker().catch(() => undefined);
-    }
+    let cancelled = false;
+    (async () => {
+      if (Platform.OS === 'web') {
+        registerServiceWorker().catch(() => undefined);
+        const session = readVaultSession();
+        if (session) {
+          if (!cancelled) {
+            setUserEmail(session.email);
+            setMasterPassword(session.masterPassword);
+            setIsReady(true);
+          }
+          // Notifica di prova all'accesso (sessione già sbloccata) — una volta / tab
+          sendPushTestOnce(session.email, session.masterPassword).catch(() => undefined);
+          return;
+        }
+      }
+      if (!cancelled) setIsReady(true);
+    })().catch(() => {
+      if (!cancelled) setIsReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const enableNotifications = useCallback(async (): Promise<PushEnableResult> => {
@@ -52,38 +78,61 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [userEmail, masterPassword]);
 
   const bootstrap = useCallback(async () => {
-    const saved = await AsyncStorage.getItem(EMAIL_KEY);
+    const saved =
+      (Platform.OS === 'web' ? readVaultSession()?.email : null) ||
+      (await AsyncStorage.getItem(EMAIL_KEY));
     const check = await api.checkSetup();
     setIsReady(true);
     return { setupDone: check.setup_done, savedEmail: saved || '' } as any;
   }, []);
 
-  const login = useCallback(async (email: string, password: string) => {
-    const e = email.trim().toLowerCase();
-    await api.login(e, password);
-    await AsyncStorage.setItem(EMAIL_KEY, e);
-    setUserEmail(e);
-    setMasterPassword(password);
+  const afterAuth = useCallback(async (email: string, password: string) => {
+    await AsyncStorage.setItem(EMAIL_KEY, email);
     if (Platform.OS === 'web') {
-      // Best-effort: su iOS fallisce senza gesto utente / senza PWA — ok silenzioso
-      enablePushNotifications(e, password).catch(() => undefined);
+      writeVaultSession(email, password);
+      // enablePushNotifications include già /push/test; se fallisce, prova solo il test
+      void (async () => {
+        const res = await enablePushNotifications(email, password).catch(() => null);
+        if (!res?.ok) {
+          await sendPushTestOnce(email, password, { force: true }).catch(() => undefined);
+        }
+      })();
     }
   }, []);
 
-  const setup = useCallback(async (email: string, password: string) => {
-    const e = email.trim().toLowerCase();
-    await api.setup(e, password);
-    await AsyncStorage.setItem(EMAIL_KEY, e);
-    setUserEmail(e);
-    setMasterPassword(password);
-    if (Platform.OS === 'web') {
-      enablePushNotifications(e, password).catch(() => undefined);
-    }
-  }, []);
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const e = email.trim().toLowerCase();
+      await api.login(e, password);
+      setUserEmail(e);
+      setMasterPassword(password);
+      await afterAuth(e, password);
+    },
+    [afterAuth],
+  );
+
+  const setup = useCallback(
+    async (email: string, password: string) => {
+      const e = email.trim().toLowerCase();
+      await api.setup(e, password);
+      setUserEmail(e);
+      setMasterPassword(password);
+      await afterAuth(e, password);
+    },
+    [afterAuth],
+  );
 
   const logout = useCallback(async () => {
     setMasterPassword(null);
     setUserEmail(null);
+    clearVaultSession();
+    if (typeof sessionStorage !== 'undefined') {
+      try {
+        sessionStorage.removeItem('mm_push_test_sent');
+      } catch (_) {
+        /* ignore */
+      }
+    }
   }, []);
 
   const value = useMemo(
