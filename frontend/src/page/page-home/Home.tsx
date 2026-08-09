@@ -35,7 +35,16 @@ function feedback(title: string, message: string) {
 }
 
 export default function Home() {
-  const { userEmail, masterPassword, isReady, logout, enableNotifications } = useAuth();
+  const {
+    userEmail,
+    masterPassword,
+    isReady,
+    logout,
+    enableNotifications,
+    isBiometricEnabled,
+    enableBiometric,
+    disableBiometric,
+  } = useAuth();
   const router = useRouter();
   const [items, setItems] = useState<MessageListItem[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -331,6 +340,20 @@ export default function Home() {
     }
   };
 
+  const onToggleBiometric = async () => {
+    try {
+      if (isBiometricEnabled) {
+        await disableBiometric();
+        feedback('Biometrica', 'Accesso biometrico disabilitato');
+      } else {
+        await enableBiometric();
+        feedback('Biometrica', 'Accesso biometrico abilitato (Windows Hello / Face ID)');
+      }
+    } catch (e: any) {
+      feedback('Biometrica', e?.message || 'Operazione fallita');
+    }
+  };
+
   if (!isReady || !userEmail || !masterPassword) {
     return (
       <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -343,21 +366,35 @@ export default function Home() {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Mail Manager</Text>
-        <View style={styles.headerActions}>
-          <TouchableOpacity onPress={() => router.push('/compose')}>
-            <Text style={styles.link}>Scrivi</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => router.push('/accounts')}>
-            <Text style={styles.link}>Account</Text>
-          </TouchableOpacity>
-          {Platform.OS === 'web' ? (
-            <TouchableOpacity onPress={onEnableNotifications} disabled={pushBusy}>
-              <Text style={styles.link}>{pushBusy ? '…' : 'Notifiche'}</Text>
+        <View style={styles.headerActionsCol}>
+          <View style={styles.headerActions}>
+            {Platform.OS === 'web' ? (
+              <TouchableOpacity onPress={onEnableNotifications} disabled={pushBusy}>
+                <Text style={styles.link}>{pushBusy ? '…' : 'Notifiche'}</Text>
+              </TouchableOpacity>
+            ) : null}
+            <TouchableOpacity onPress={onToggleBiometric}>
+              <Text style={isBiometricEnabled ? styles.link : styles.linkMuted}>
+                {isBiometricEnabled ? 'Biometria ON' : 'Biometria'}
+              </Text>
             </TouchableOpacity>
-          ) : null}
-          <TouchableOpacity onPress={() => logout()}>
-            <Text style={styles.linkMuted}>Esci</Text>
-          </TouchableOpacity>
+            <TouchableOpacity
+              onPress={async () => {
+                await logout();
+                router.replace('/login');
+              }}
+            >
+              <Text style={styles.linkMuted}>Esci</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.headerActions}>
+            <TouchableOpacity onPress={() => router.push('/compose')}>
+              <Text style={styles.link}>Scrivi</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => router.push('/accounts')}>
+              <Text style={styles.link}>Account</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
 
@@ -587,14 +624,17 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-start',
   },
-  title: { color: '#fff', fontSize: 22, fontWeight: '700' },
+  title: { color: '#fff', fontSize: 22, fontWeight: '700', paddingTop: 2 },
+  headerActionsCol: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
   headerActions: {
     flexDirection: 'row',
     gap: 12,
     alignItems: 'center',
-    flexWrap: 'wrap',
     justifyContent: 'flex-end',
   },
   link: { color: '#4ecdc4', fontWeight: '600' },

@@ -1,30 +1,37 @@
 # Mail Manager (v2)
 
-Vault personale multi-casella: **Gmail, Outlook, IMAP e PEC** (lettura + **invio PEC**), inbox unificata, ricevute certificate, PWA.
+Vault personale multi-casella: **Gmail, Outlook, IMAP e PEC** (lettura + invio), inbox unificata, ricevute certificate, PWA con web push.
 
-URL target: `https://mail.colorsdev.tech`
+URL: https://mail.colorsdev.tech
 
-Stack: **Expo (React Native / Web PWA)** · **FastAPI** · **MongoDB** · worker sync IMAP.
+Stack: **Expo (React Native / Web PWA)** · **FastAPI** · **MongoDB** · sync IMAP in background.
 
 Sibling di [Password Manager](https://github.com/Matt7046/password-manager) e [Activity Manager](https://github.com/Matt7046/activity-manager).
 
-## Scope v2 (questo scaffold)
+## Funzionalità
 
-- Auth vault (master password + biometria lato app)
-- Account: Google / Microsoft OAuth (hook), IMAP, **PEC**
-- Inbox unificata, filtri, cerca
-- Dettaglio messaggio + allegati meta
-- **Compose** anche da account PEC + tracking ricevute
-- Regole semplici, export ZIP (stub), sync status
-- PWA installabile
+- Auth vault con **master password**
+- **Biometria** (come Password Manager): Windows Hello / Face ID / impronta via WebAuthn o `expo-local-authentication`. Si abilita da Home → **Biometria**; al login successivo usa **Usa biometrica** (o prompt automatico)
+- Sessione tab in PWA (con biometria attiva serve Hello/password dopo Esci)
+- Account: **OAuth Google / Microsoft** (IMAP/SMTP XOAUTH2), IMAP password, **PEC** (preset Aruba, Legalmail, Intesi, …)
+- Inbox unificata con cartelle **Ricevute / Inviate / Cestino**
+- Filtri combinabili: account, non lette, PEC; ricerca
+- Dettaglio messaggio (HTML + immagini CID), allegati, flag letto
+- Compose da qualsiasi account (anche PEC) + tracking ricevute
+- Sync IMAP periodico (INBOX + Sent, inclusa Posta inviata Gmail) e pull-to-refresh
+- Web Push su nuova mail; PWA installabile
+- Export messaggio (ZIP), regole semplici
+
+Dettagli OAuth: [`backend/OAUTH.md`](backend/OAUTH.md).
 
 ## Struttura
 
 ```
 mail-manager/
-  backend/          FastAPI + Mongo
-  frontend/         Expo Router PWA
-  BRIEF.md          prodotto v1→v2
+  backend/              FastAPI + Mongo + mail_provider (IMAP/SMTP)
+  backend/bat/deploy/   Script deploy VPS
+  frontend/             Expo Router PWA
+  BRIEF.md              brief prodotto
 ```
 
 ## Avvio locale
@@ -34,10 +41,12 @@ mail-manager/
 ```bash
 cd backend
 cp .env.EMPTY .env
-# MONGO_URL=...  DB_NAME=mail_manager  SERVER_SECRET=...
+# Compila MONGO_URL, DB_NAME, SERVER_SECRET (e opz. Google/Microsoft OAuth)
 pip install -r requirements.txt
 uvicorn server:app --reload --port 8000
 ```
+
+Health: `GET http://localhost:8000/api/health`
 
 ### Frontend
 
@@ -51,22 +60,26 @@ npx expo start --web
 
 ## Deploy → https://mail.colorsdev.tech
 
-Come **Password Manager**: DNS **GoDaddy** → VPS → nginx Activity Manager (`/root/nginx-apps/mail.colorsdev.tech.conf`) + API Docker sulla rete `backend_app-network`.
+DNS **GoDaddy** → VPS → nginx Activity Manager (`/root/nginx-apps/mail.colorsdev.tech.conf`) + API Docker sulla rete `backend_app-network`. Niente Cloudflare Tunnel.
 
 ```bat
 cd backend\bat\deploy
-SETUP-SERVER.BAT          rem conf nginx-apps + compose + cert
-rem GoDaddy A record + certbot per mail.colorsdev.tech
+SETUP-SERVER.BAT          rem una tantum: conf nginx-apps + compose + cert
 DEPLOY-ALL.BAT            rem API Hub + web static
 ```
 
-Script: `SETUP-SERVER.BAT` · `DEPLOY-API.BAT` · `DEPLOY-WEB.BAT` · `DEPLOY-ALL.BAT`  
-Niente Cloudflare Tunnel.
+| Script | Cosa fa |
+|--------|---------|
+| `SETUP-SERVER.BAT` | Setup VPS / nginx-apps |
+| `DEPLOY-API.BAT` | Build/push image + recreate `mail-manager` |
+| `DEPLOY-WEB.BAT` | Export Expo → `/root/mail-manager/web` + reload nginx |
+| `DEPLOY-ALL.BAT` | API + WEB |
 
-## Cosa non è ancora wired
+Guida: [`backend/bat/deploy/README.md`](backend/bat/deploy/README.md).
 
-- Sync IMAP reale / OAuth token exchange (hook + modelli pronti)
-- IDLE push e notifiche web push
-- Sanitizzazione HTML avanzata e antivirus allegati
+## Sicurezza
 
-I contratti API e le schermate ci sono: si implementano i provider sopra lo scheletro.
+- Password IMAP e token OAuth cifrati (chiave da email vault + `SERVER_SECRET`)
+- Body messaggi cifrati a riposo dove previsto
+- Biometria: WebAuthn / hardware come gate locale; la master password resta la chiave API (salvata in storage sicuro solo dopo abilitazione)
+- Non loggare master password / secret in chiaro

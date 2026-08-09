@@ -1,6 +1,15 @@
-import React, { createContext, useContext, useMemo, useState, useCallback, useEffect } from 'react';
+import React, {
+  createContext,
+  useContext,
+  useMemo,
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+} from 'react';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as LocalAuthentication from 'expo-local-authentication';
 import { api } from '@/src/services/api';
 import {
   enablePushNotifications,
@@ -12,39 +21,59 @@ import {
   readVaultSession,
   writeVaultSession,
 } from '@/src/lib/vaultSession';
+import { storage } from '@/src/utils/storage';
 
 type AuthCtx = {
   userEmail: string | null;
   masterPassword: string | null;
   isReady: boolean;
+  isBiometricEnabled: boolean;
   login: (email: string, password: string) => Promise<void>;
   setup: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   bootstrap: () => Promise<{ setupDone: boolean }>;
   enableNotifications: () => Promise<PushEnableResult>;
+  enableBiometric: () => Promise<void>;
+  disableBiometric: () => Promise<void>;
+  authenticateWithBiometric: () => Promise<void>;
 };
 
 const Ctx = createContext<AuthCtx | null>(null);
 const EMAIL_KEY = 'mm_email';
+const BIO_FLAG = 'mm_biometric_enabled';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [masterPassword, setMasterPassword] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
+  const [isBiometricEnabled, setIsBiometricEnabled] = useState(false);
+  const biometricAuthInFlight = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const enabled = (await storage.getItem(BIO_FLAG, 'false')) === 'true';
+      if (!cancelled) setIsBiometricEnabled(enabled);
+
       if (Platform.OS === 'web') {
         registerServiceWorker().catch(() => undefined);
-        const session = readVaultSession();
-        if (session) {
-          if (!cancelled) {
-            setUserEmail(session.email);
-            setMasterPassword(session.masterPassword);
-            setIsReady(true);
+        // Con biometrica attiva non auto-sbloccare: serve Hello / Face ID su Login
+        if (!enabled) {
+          const session = readVaultSession();
+          if (session) {
+            if (!cancelled) {
+              setUserEmail(session.email);
+              setMasterPassword(session.masterPassword);
+              setIsReady(true);
+            }
+            return;
           }
-          return;
+        } else {
+          // Prefill email da vault / storage senza sbloccare la master
+          const session = readVaultSession();
+          const savedEmail =
+            session?.email || (await AsyncStorage.getItem(EMAIL_KEY)) || null;
+          if (savedEmail && !cancelled) setUserEmail(savedEmail);
         }
       }
       if (!cancelled) setIsReady(true);
@@ -87,7 +116,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await AsyncStorage.setItem(EMAIL_KEY, email);
     if (Platform.OS === 'web') {
       writeVaultSession(email, password);
-      // Solo subscription push — niente notifica di prova
       enablePushNotifications(email, password).catch(() => undefined);
     }
   }, []);
@@ -116,22 +144,148 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     setMasterPassword(null);
-    setUserEmail(null);
+    // tieni email per prefill login / biometrica
     clearVaultSession();
   }, []);
+
+  const enableBiometric = useCallback(async () => {
+    if (!masterPassword || !userEmail) {
+      throw new Error('Accedi prima di abilitare la biometrica');
+    }
+
+    const hasHardware = await LocalAuthentication.hasHardwareAsync();
+    const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+
+    if (hasHardware && isEnrolled) {
+      await storage.secureSet('master_password', masterPassword);
+      await storage.secureSet('user_email', userEmail);
+      await storage.setItem(BIO_FLAG, 'true');
+      setIsBiometricEnabled(true);
+      return;
+    }
+
+    const { isWebPlatformAuthAvailable, registerWebPlatformAuth } = await import(
+      '@/src/utils/webBiometric'
+    );
+    if (await isWebPlatformAuthAvailable()) {
+      await registerWebPlatformAuth(userEmail);
+      await storage.secureSet('master_password', masterPassword);
+      await storage.secureSet('user_email', userEmail);
+      await storage.setItem(BIO_FLAG, 'true');
+      setIsBiometricEnabled(true);
+      return;
+    }
+
+    throw new Error(
+      'Biometrica non disponibile. Su PC serve Windows Hello (o Touch ID) nel browser.',
+    );
+  }, [masterPassword, userEmail]);
+
+  const disableBiometric = useCallback(async () => {
+    await storage.secureSet('master_password', '');
+    await storage.secureSet('user_email', '');
+    await storage.setItem(BIO_FLAG, 'false');
+    setIsBiometricEnabled(false);
+    try {
+      const { clearWebPlatformAuth } = await import('@/src/utils/webBiometric');
+      clearWebPlatformAuth();
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const authenticateWithBiometric = useCallback(async () => {
+    if (biometricAuthInFlight.current) {
+      return biometricAuthInFlight.current;
+    }
+
+    const authPromise = (async () => {
+      const hasHardware = await LocalAuthentication.hasHardwareAsync();
+      const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+
+      let verified = false;
+
+      if (hasHardware && isEnrolled) {
+        const result = await LocalAuthentication.authenticateAsync({
+          promptMessage: 'Sblocca Mail Manager',
+          fallbackLabel: 'Usa Password Master',
+        });
+        verified = result.success;
+      } else {
+        const { authenticateWebPlatformAuth } = await import('@/src/utils/webBiometric');
+        verified = await authenticateWebPlatformAuth();
+      }
+
+      if (!verified) {
+        throw new Error('Autenticazione biometrica fallita o annullata');
+      }
+
+      const savedPassword = await storage.secureGet('master_password', null);
+      const savedEmail = await storage.secureGet('user_email', null);
+      if (savedPassword && savedEmail) {
+        try {
+          await login(savedEmail, savedPassword);
+        } catch {
+          await storage.secureSet('master_password', '');
+          await storage.secureSet('user_email', '');
+          await storage.setItem(BIO_FLAG, 'false');
+          setIsBiometricEnabled(false);
+          try {
+            const { clearWebPlatformAuth } = await import('@/src/utils/webBiometric');
+            clearWebPlatformAuth();
+          } catch {
+            /* ignore */
+          }
+          throw new Error(
+            'La password è stata cambiata. Accedi con la nuova password master e ri-abilita la biometrica.',
+          );
+        }
+      } else {
+        await storage.setItem(BIO_FLAG, 'false');
+        setIsBiometricEnabled(false);
+        throw new Error('Nessuna credenziale salvata. Accedi con la password master.');
+      }
+    })();
+
+    biometricAuthInFlight.current = authPromise;
+    try {
+      await authPromise;
+    } finally {
+      if (biometricAuthInFlight.current === authPromise) {
+        biometricAuthInFlight.current = null;
+      }
+    }
+  }, [login]);
 
   const value = useMemo(
     () => ({
       userEmail,
       masterPassword,
       isReady,
+      isBiometricEnabled,
       login,
       setup,
       logout,
       bootstrap,
       enableNotifications,
+      enableBiometric,
+      disableBiometric,
+      authenticateWithBiometric,
     }),
-    [userEmail, masterPassword, isReady, login, setup, logout, bootstrap, enableNotifications],
+    [
+      userEmail,
+      masterPassword,
+      isReady,
+      isBiometricEnabled,
+      login,
+      setup,
+      logout,
+      bootstrap,
+      enableNotifications,
+      enableBiometric,
+      disableBiometric,
+      authenticateWithBiometric,
+    ],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
