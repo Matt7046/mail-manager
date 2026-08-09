@@ -82,4 +82,3 @@ Guida: [`backend/bat/deploy/README.md`](backend/bat/deploy/README.md).
 - Password IMAP e token OAuth cifrati (chiave da email vault + `SERVER_SECRET`)
 - Body messaggi cifrati a riposo dove previsto
 - Biometria: WebAuthn / hardware come gate locale; la master password resta la chiave API (salvata in storage sicuro solo dopo abilitazione)
-- Non loggare master password / secret in chiaro
