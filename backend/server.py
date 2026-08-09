@@ -749,7 +749,8 @@ async def list_messages(
     limit: int = Query(50, ge=1, le=200),
 ):
     await require_user(email.lower(), master_password)
-    filt: Dict[str, Any] = {"user_email": email.lower()}
+    email_l = email.lower()
+    filt: Dict[str, Any] = {"user_email": email_l}
     if account:
         filt["account_id"] = account
     folder_l = (folder or "inbox").lower()
@@ -762,14 +763,52 @@ async def list_messages(
         filt["folder"] = {"$nin": ["trash", "sent"]}
     if unread is True:
         filt["flags.seen"] = False
+
+    and_clauses: List[Dict[str, Any]] = []
+
+    # Account PEC: servono per filtro e badge (query leggera su accounts)
+    pec_acc_ids: List[str] = [
+        str(a["_id"])
+        async for a in db.accounts.find(
+            {
+                "user_email": email_l,
+                "$or": [
+                    {"type": "pec"},
+                    {
+                        "pec_provider": {
+                            "$in": ["aruba", "legalmail", "postecert", "intesi"]
+                        }
+                    },
+                ],
+            },
+            {"_id": 1},
+        )
+    ]
+    pec_acc_set = set(pec_acc_ids)
+
     if pec is True:
-        filt["is_pec"] = True
-    if q:
-        filt["$or"] = [
-            {"subject": {"$regex": q, "$options": "i"}},
-            {"from_addr": {"$regex": q, "$options": "i"}},
-            {"snippet": {"$regex": q, "$options": "i"}},
+        # Un solo $in su is_pec + account PEC (evita $or a 4 rami lenti)
+        pec_or: List[Dict[str, Any]] = [
+            {"is_pec": {"$in": [True, 1, "1", "true"]}},
         ]
+        if pec_acc_ids:
+            pec_or.append({"account_id": {"$in": pec_acc_ids}})
+        and_clauses.append({"$or": pec_or})
+
+    if q:
+        and_clauses.append(
+            {
+                "$or": [
+                    {"subject": {"$regex": q, "$options": "i"}},
+                    {"from_addr": {"$regex": q, "$options": "i"}},
+                    {"snippet": {"$regex": q, "$options": "i"}},
+                ]
+            }
+        )
+
+    if and_clauses:
+        filt["$and"] = and_clauses
+
     skip = (page - 1) * limit
     total = await db.messages.count_documents(filt)
     cur = (
@@ -780,6 +819,10 @@ async def list_messages(
     )
     items = []
     async for m in cur:
+        raw_pec = m.get("is_pec")
+        is_pec = bool(raw_pec in (True, 1, "1", "true")) or (
+            str(m.get("account_id") or "") in pec_acc_set
+        )
         items.append(
             {
                 "id": str(m["_id"]),
@@ -790,7 +833,7 @@ async def list_messages(
                 "date": m.get("date"),
                 "flags": m.get("flags", {}),
                 "has_attachments": m.get("has_attachments", False),
-                "is_pec": m.get("is_pec", False),
+                "is_pec": is_pec,
                 "snippet": m.get("snippet", ""),
                 "priority": m.get("priority"),
                 "folder": m.get("folder") or "INBOX",

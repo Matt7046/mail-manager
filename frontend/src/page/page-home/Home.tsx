@@ -14,15 +14,15 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
 import { api, Account, MessageListItem } from '@/src/services/api';
 
-type Filter = 'inbox' | 'sent' | 'unread' | 'pec' | 'trash';
+type FolderTab = 'inbox' | 'sent' | 'trash';
 
 const AUTO_SYNC_MS = 90_000;
+const PULL_THRESHOLD = 72;
+const PULL_MAX = 120;
 
-const FILTER_LABELS: Record<Filter, string> = {
+const FOLDER_LABELS: Record<FolderTab, string> = {
   inbox: 'Ricevute',
   sent: 'Inviate',
-  unread: 'Non lette',
-  pec: 'PEC',
   trash: 'Cestino',
 };
 
@@ -41,12 +41,22 @@ export default function Home() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [accountId, setAccountId] = useState('');
   const [q, setQ] = useState('');
-  const [filter, setFilter] = useState<Filter>('inbox');
+  const [folder, setFolder] = useState<FolderTab>('inbox');
+  const [onlyUnread, setOnlyUnread] = useState(false);
+  const [onlyPec, setOnlyPec] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [pullPx, setPullPx] = useState(0);
   const [syncHint, setSyncHint] = useState<string | null>(null);
   const [pushHint, setPushHint] = useState<{ ok: boolean; text: string } | null>(null);
   const [pushBusy, setPushBusy] = useState(false);
   const lastCount = useRef(0);
+  const atTopRef = useRef(true);
+  const pullActiveRef = useRef(false);
+  const pullStartYRef = useRef(0);
+  const pullDistRef = useRef(0);
+  const refreshingRef = useRef(false);
+  const wheelAccRef = useRef(0);
+  const listWrapRef = useRef<View>(null);
 
   // Evita inbox vuota / "account non collegati" se si apre /home senza vault sbloccato
   useEffect(() => {
@@ -65,20 +75,21 @@ export default function Home() {
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
-    const folder =
-      filter === 'trash' ? 'trash' : filter === 'sent' ? 'sent' : 'inbox';
     const data = await api.listMessages({
       email: userEmail,
       master_password: masterPassword,
       account: accountId || undefined,
       q: q.trim() || undefined,
-      unread: filter === 'unread' ? true : undefined,
-      pec: filter === 'pec' ? true : undefined,
+      unread: onlyUnread ? true : undefined,
+      pec: onlyPec ? true : undefined,
       folder,
     });
     setItems(data.items);
     lastCount.current = data.total ?? data.items.length;
-  }, [userEmail, masterPassword, q, filter, accountId]);
+  }, [userEmail, masterPassword, q, folder, onlyUnread, onlyPec, accountId]);
+
+  const loadRef = useRef(load);
+  loadRef.current = load;
 
   const runSync = useCallback(
     async (silent = false) => {
@@ -88,29 +99,33 @@ export default function Home() {
         const n = res?.messages_inserted ?? 0;
         if (n > 0) {
           setSyncHint(`${n} nuov${n === 1 ? 'a' : 'e'} email sincronizzat${n === 1 ? 'a' : 'e'}`);
-          // Non usare Notification API in-page: le push devono arrivare dal server
-          // (Web Push → SW) anche a app chiusa. La notifica locale confondeva il test Android.
         } else if (!silent) {
           setSyncHint('Inbox aggiornata');
         }
         if (res?.errors?.length && !silent) {
           Alert.alert('Sync parziale', res.errors.join('\n'));
         }
-        await load();
+        await loadRef.current();
       } catch (e: any) {
         if (!silent) Alert.alert('Sync', e.message);
         setSyncHint(e.message);
       }
     },
-    [userEmail, masterPassword, load],
+    [userEmail, masterPassword],
   );
 
+  // Cambio filtri → solo lista messaggi (veloce). Mai sync IMAP qui.
+  useEffect(() => {
+    if (!userEmail || !masterPassword) return;
+    load().catch((e) => Alert.alert('Errore', e.message));
+  }, [load, userEmail, masterPassword]);
+
+  // Sync IMAP solo all'ingresso in Home (e pull-to-refresh / intervallo)
   useFocusEffect(
     useCallback(() => {
       loadAccounts().catch(() => undefined);
-      load().catch((e) => Alert.alert('Errore', e.message));
       runSync(true).catch(() => undefined);
-    }, [load, loadAccounts, runSync]),
+    }, [loadAccounts, runSync]),
   );
 
   useEffect(() => {
@@ -121,14 +136,183 @@ export default function Home() {
     return () => clearInterval(id);
   }, [userEmail, masterPassword, runSync]);
 
-  const onRefresh = async () => {
+  const onRefresh = useCallback(async () => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
     setRefreshing(true);
+    setPullPx(0);
+    pullDistRef.current = 0;
+    wheelAccRef.current = 0;
     try {
       await runSync(false);
     } finally {
+      refreshingRef.current = false;
       setRefreshing(false);
     }
-  };
+  }, [runSync]);
+
+  const resetPull = useCallback(() => {
+    pullActiveRef.current = false;
+    pullDistRef.current = 0;
+    wheelAccRef.current = 0;
+    setPullPx(0);
+  }, []);
+
+  const finishPull = useCallback(() => {
+    const dist = pullDistRef.current;
+    pullActiveRef.current = false;
+    if (dist >= PULL_THRESHOLD && !refreshingRef.current) {
+      void onRefresh();
+    } else {
+      resetPull();
+    }
+  }, [onRefresh, resetPull]);
+
+  const onListScroll = useCallback(
+    (e: any) => {
+      const y = e?.nativeEvent?.contentOffset?.y ?? 0;
+      atTopRef.current = y <= 2;
+      if (y > 2 && pullDistRef.current > 0) {
+        resetPull();
+      }
+    },
+    [resetPull],
+  );
+
+  const onWebWheel = useCallback(
+    (e: any) => {
+      if (Platform.OS !== 'web' || refreshingRef.current) return;
+      const deltaY = e?.deltaY ?? e?.nativeEvent?.deltaY ?? 0;
+      if (!atTopRef.current) {
+        wheelAccRef.current = 0;
+        return;
+      }
+      if (deltaY >= 0) {
+        if (wheelAccRef.current > 0) {
+          wheelAccRef.current = Math.max(0, wheelAccRef.current - deltaY * 0.35);
+          pullDistRef.current = wheelAccRef.current;
+          setPullPx(Math.min(wheelAccRef.current, PULL_MAX));
+        }
+        return;
+      }
+      wheelAccRef.current = Math.min(PULL_MAX, wheelAccRef.current + Math.abs(deltaY) * 0.45);
+      pullDistRef.current = wheelAccRef.current;
+      setPullPx(wheelAccRef.current);
+      if (wheelAccRef.current >= PULL_THRESHOLD) {
+        e?.preventDefault?.();
+        void onRefresh();
+      }
+    },
+    [onRefresh],
+  );
+
+  // Web: FlatList cattura spesso touch/wheel — listener in capture sul wrap + scroll interno
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
+    let targets: HTMLElement[] = [];
+    let cancelled = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const resolveDom = (node: unknown): HTMLElement | null => {
+      if (!node) return null;
+      if (typeof HTMLElement !== 'undefined' && node instanceof HTMLElement) return node;
+      const anyNode = node as any;
+      if (anyNode?.nodeType === 1) return anyNode as HTMLElement;
+      if (anyNode?._nativeNode?.nodeType === 1) return anyNode._nativeNode as HTMLElement;
+      return null;
+    };
+
+    const detach = () => {
+      for (const el of targets) {
+        const cleanup = (el as any).__mmPullCleanup;
+        if (typeof cleanup === 'function') cleanup();
+      }
+      targets = [];
+    };
+
+    const bind = (el: HTMLElement) => {
+      if ((el as any).__mmPullCleanup) return;
+      const onTouchStart = (ev: TouchEvent) => {
+        if (!atTopRef.current || refreshingRef.current) return;
+        const t = ev.touches[0];
+        if (!t) return;
+        pullActiveRef.current = true;
+        pullStartYRef.current = t.clientY;
+        pullDistRef.current = 0;
+      };
+      const onTouchMove = (ev: TouchEvent) => {
+        if (!pullActiveRef.current || refreshingRef.current) return;
+        if (!atTopRef.current) {
+          resetPull();
+          return;
+        }
+        const t = ev.touches[0];
+        if (!t) return;
+        const dist = Math.max(0, (t.clientY - pullStartYRef.current) * 0.55);
+        pullDistRef.current = dist;
+        setPullPx(Math.min(dist, PULL_MAX));
+        if (dist > 10) ev.preventDefault();
+      };
+      const onTouchEnd = () => {
+        if (!pullActiveRef.current) return;
+        finishPull();
+      };
+      const onWheel = (ev: WheelEvent) => onWebWheel(ev);
+
+      el.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+      el.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
+      el.addEventListener('touchend', onTouchEnd, { capture: true });
+      el.addEventListener('touchcancel', onTouchEnd, { capture: true });
+      el.addEventListener('wheel', onWheel, { passive: false, capture: true });
+
+      (el as any).__mmPullCleanup = () => {
+        el.removeEventListener('touchstart', onTouchStart, true);
+        el.removeEventListener('touchmove', onTouchMove, true);
+        el.removeEventListener('touchend', onTouchEnd, true);
+        el.removeEventListener('touchcancel', onTouchEnd, true);
+        el.removeEventListener('wheel', onWheel, true);
+        delete (el as any).__mmPullCleanup;
+      };
+      targets.push(el);
+    };
+
+    const attach = () => {
+      if (cancelled) return;
+      detach();
+      const wrap =
+        resolveDom(listWrapRef.current) ||
+        (document.querySelector('[data-mm-inbox-list]') as HTMLElement | null);
+      if (!wrap) return;
+      bind(wrap);
+      const scrollables = wrap.querySelectorAll<HTMLElement>(
+        '[data-testid="scrollView"], [style*="overflow"], div',
+      );
+      for (const el of Array.from(scrollables)) {
+        const style = window.getComputedStyle(el);
+        const oy = style.overflowY;
+        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') {
+          bind(el);
+          break;
+        }
+      }
+    };
+
+    timers.push(setTimeout(attach, 0));
+    timers.push(setTimeout(attach, 250));
+    timers.push(setTimeout(attach, 800));
+
+    return () => {
+      cancelled = true;
+      timers.forEach(clearTimeout);
+      detach();
+    };
+  }, [finishPull, onWebWheel, resetPull, userEmail, masterPassword, items.length]);
+
+  const pullLabel = refreshing
+    ? 'Sincronizzazione…'
+    : pullPx >= PULL_THRESHOLD
+      ? 'Rilascia per aggiornare'
+      : 'Scorri per aggiornare · o tocca qui';
 
   const onEnableNotifications = async () => {
     if (pushBusy) return;
@@ -192,17 +376,31 @@ export default function Home() {
       />
 
       <View style={styles.filters}>
-        {(['inbox', 'sent', 'unread', 'pec', 'trash'] as Filter[]).map((f) => (
+        {(['inbox', 'sent', 'trash'] as FolderTab[]).map((f) => (
           <TouchableOpacity
             key={f}
-            style={[styles.chip, filter === f && styles.chipOn]}
-            onPress={() => setFilter(f)}
+            style={[styles.chip, folder === f && styles.chipOn]}
+            onPress={() => setFolder(f)}
           >
-            <Text style={[styles.chipText, filter === f && styles.chipTextOn]}>
-              {FILTER_LABELS[f]}
+            <Text style={[styles.chipText, folder === f && styles.chipTextOn]}>
+              {FOLDER_LABELS[f]}
             </Text>
           </TouchableOpacity>
         ))}
+      </View>
+      <View style={styles.filters}>
+        <TouchableOpacity
+          style={[styles.chip, onlyUnread && styles.chipOn]}
+          onPress={() => setOnlyUnread((v) => !v)}
+        >
+          <Text style={[styles.chipText, onlyUnread && styles.chipTextOn]}>Non lette</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.chip, onlyPec && styles.chipOn]}
+          onPress={() => setOnlyPec((v) => !v)}
+        >
+          <Text style={[styles.chipText, onlyPec && styles.chipTextOn]}>PEC</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.accountFilterWrap}>
@@ -256,63 +454,107 @@ export default function Home() {
           )}
       </View>
 
-      <FlatList
-        data={items}
-        keyExtractor={(i) => i.id}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#4ecdc4" />
-        }
-        contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
-        ListEmptyComponent={
-          <Text style={styles.empty}>
-            {!userEmail || !masterPassword
-              ? 'Sessione non attiva. Reindirizzamento al login…'
-              : filter === 'trash'
-                ? 'Cestino vuoto.'
-                : filter === 'sent'
-                  ? 'Nessuna email inviata.'
-                  : accounts.length === 0
-                    ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
-                    : 'Nessuna email ricevuta. La sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
-          </Text>
-        }
-        renderItem={({ item }) => {
-          const isSent =
-            filter === 'sent' || (item.folder || '').toLowerCase() === 'sent';
-          const peer = isSent
-            ? (item.to?.length ? item.to.join(', ') : '—')
-            : item.from;
-          return (
-          <TouchableOpacity
-            style={[styles.card, !item.flags?.seen && !isSent && styles.cardUnread]}
-            onPress={() => router.push({ pathname: '/message', params: { id: item.id } })}
-          >
-            <View style={styles.cardTop}>
-              <Text style={styles.from} numberOfLines={1}>
-                {isSent ? `A: ${peer}` : peer}
+      <View
+        ref={listWrapRef}
+        style={styles.listWrap}
+        {...(Platform.OS === 'web'
+          ? ({
+              // marker per listener DOM (RefreshControl su web spesso non funziona)
+              'data-mm-inbox-list': '1',
+            } as any)
+          : {})}
+      >
+        <FlatList
+          data={items}
+          keyExtractor={(i) => i.id}
+          onScroll={onListScroll}
+          scrollEventThrottle={16}
+          refreshControl={
+            Platform.OS === 'web' ? undefined : (
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#4ecdc4" />
+            )
+          }
+          contentContainerStyle={{ padding: 16, paddingBottom: 40, flexGrow: 1 }}
+          ListHeaderComponent={
+            <TouchableOpacity
+              activeOpacity={0.7}
+              disabled={refreshing}
+              onPress={() => {
+                if (!refreshingRef.current) void onRefresh();
+              }}
+              style={[
+                styles.pullHeader,
+                {
+                  height: refreshing ? 40 : Math.max(32, pullPx > 0 ? 32 + pullPx * 0.25 : 32),
+                  opacity: refreshing || pullPx > 12 ? 1 : 0.7,
+                },
+              ]}
+            >
+              <Text style={styles.pullText}>{pullLabel}</Text>
+            </TouchableOpacity>
+          }
+          ListEmptyComponent={
+            <Text style={styles.empty}>
+              {!userEmail || !masterPassword
+                ? 'Sessione non attiva. Reindirizzamento al login…'
+                : folder === 'trash'
+                  ? 'Cestino vuoto.'
+                  : folder === 'sent'
+                    ? onlyPec
+                      ? 'Nessuna PEC inviata con questi filtri.'
+                      : 'Nessuna email inviata.'
+                    : accounts.length === 0
+                      ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
+                      : onlyPec
+                        ? 'Nessuna PEC ricevuta con questi filtri.'
+                        : 'Nessuna email ricevuta. Scorri (o tocca) per sincronizzare — sync automatica ogni ~90s.'}
+            </Text>
+          }
+          renderItem={({ item }) => {
+            const isSent =
+              folder === 'sent' || (item.folder || '').toLowerCase() === 'sent';
+            const peer = isSent
+              ? (item.to?.length ? item.to.join(', ') : '—')
+              : item.from;
+            return (
+            <TouchableOpacity
+              style={[styles.card, !item.flags?.seen && !isSent && styles.cardUnread]}
+              onPress={() => router.push({ pathname: '/message', params: { id: item.id } })}
+            >
+              <View style={styles.cardTop}>
+                <Text style={styles.from} numberOfLines={1}>
+                  {isSent ? `A: ${peer}` : peer}
+                </Text>
+                {item.is_pec ? (
+                  <View style={styles.pecBadge}>
+                    <Text style={styles.pecText}>PEC</Text>
+                  </View>
+                ) : null}
+              </View>
+              <Text style={styles.subject} numberOfLines={1}>
+                {item.subject || '(senza oggetto)'}
               </Text>
-              {item.is_pec ? (
-                <View style={styles.pecBadge}>
-                  <Text style={styles.pecText}>PEC</Text>
-                </View>
-              ) : null}
-            </View>
-            <Text style={styles.subject} numberOfLines={1}>
-              {item.subject || '(senza oggetto)'}
-            </Text>
-            <Text style={styles.snippet} numberOfLines={2}>
-              {item.snippet}
-            </Text>
-          </TouchableOpacity>
-          );
-        }}
-      />
+              <Text style={styles.snippet} numberOfLines={2}>
+                {item.snippet}
+              </Text>
+            </TouchableOpacity>
+            );
+          }}
+        />
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0b1220' },
+  listWrap: { flex: 1 },
+  pullHeader: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  pullText: { color: '#7a8aaa', fontSize: 12, fontWeight: '600' },
   header: {
     paddingTop: 52,
     paddingHorizontal: 16,

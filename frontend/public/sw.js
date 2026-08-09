@@ -1,4 +1,4 @@
-const CACHE = "mail-manager-v7";
+const CACHE = "mail-manager-v8";
 const PRECACHE = [
   "/",
   "/manifest.webmanifest",
