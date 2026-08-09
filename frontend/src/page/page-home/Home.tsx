@@ -14,12 +14,13 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
 import { api, Account, MessageListItem } from '@/src/services/api';
 
-type Filter = 'all' | 'unread' | 'pec' | 'trash';
+type Filter = 'inbox' | 'sent' | 'unread' | 'pec' | 'trash';
 
 const AUTO_SYNC_MS = 90_000;
 
 const FILTER_LABELS: Record<Filter, string> = {
-  all: 'Tutte',
+  inbox: 'Ricevute',
+  sent: 'Inviate',
   unread: 'Non lette',
   pec: 'PEC',
   trash: 'Cestino',
@@ -40,7 +41,7 @@ export default function Home() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [accountId, setAccountId] = useState('');
   const [q, setQ] = useState('');
-  const [filter, setFilter] = useState<Filter>('all');
+  const [filter, setFilter] = useState<Filter>('inbox');
   const [refreshing, setRefreshing] = useState(false);
   const [syncHint, setSyncHint] = useState<string | null>(null);
   const [pushHint, setPushHint] = useState<{ ok: boolean; text: string } | null>(null);
@@ -64,6 +65,8 @@ export default function Home() {
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
+    const folder =
+      filter === 'trash' ? 'trash' : filter === 'sent' ? 'sent' : 'inbox';
     const data = await api.listMessages({
       email: userEmail,
       master_password: masterPassword,
@@ -71,7 +74,7 @@ export default function Home() {
       q: q.trim() || undefined,
       unread: filter === 'unread' ? true : undefined,
       pec: filter === 'pec' ? true : undefined,
-      folder: filter === 'trash' ? 'trash' : undefined,
+      folder,
     });
     setItems(data.items);
     lastCount.current = data.total ?? data.items.length;
@@ -189,7 +192,7 @@ export default function Home() {
       />
 
       <View style={styles.filters}>
-        {(['all', 'unread', 'pec', 'trash'] as Filter[]).map((f) => (
+        {(['inbox', 'sent', 'unread', 'pec', 'trash'] as Filter[]).map((f) => (
           <TouchableOpacity
             key={f}
             style={[styles.chip, filter === f && styles.chipOn]}
@@ -266,19 +269,27 @@ export default function Home() {
               ? 'Sessione non attiva. Reindirizzamento al login…'
               : filter === 'trash'
                 ? 'Cestino vuoto.'
-                : accounts.length === 0
-                  ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
-                  : 'Nessuna email. La sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
+                : filter === 'sent'
+                  ? 'Nessuna email inviata.'
+                  : accounts.length === 0
+                    ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
+                    : 'Nessuna email ricevuta. La sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
           </Text>
         }
-        renderItem={({ item }) => (
+        renderItem={({ item }) => {
+          const isSent =
+            filter === 'sent' || (item.folder || '').toLowerCase() === 'sent';
+          const peer = isSent
+            ? (item.to?.length ? item.to.join(', ') : '—')
+            : item.from;
+          return (
           <TouchableOpacity
-            style={[styles.card, !item.flags?.seen && styles.cardUnread]}
+            style={[styles.card, !item.flags?.seen && !isSent && styles.cardUnread]}
             onPress={() => router.push({ pathname: '/message', params: { id: item.id } })}
           >
             <View style={styles.cardTop}>
               <Text style={styles.from} numberOfLines={1}>
-                {item.from}
+                {isSent ? `A: ${peer}` : peer}
               </Text>
               {item.is_pec ? (
                 <View style={styles.pecBadge}>
@@ -293,7 +304,8 @@ export default function Home() {
               {item.snippet}
             </Text>
           </TouchableOpacity>
-        )}
+          );
+        }}
       />
     </View>
   );

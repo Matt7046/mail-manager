@@ -758,8 +758,8 @@ async def list_messages(
     elif folder_l == "sent":
         filt["folder"] = "sent"
     else:
-        # inbox / default: escludi cestino ($ne matcha anche messaggi legacy senza folder)
-        filt["folder"] = {"$ne": "trash"}
+        # Ricevute (inbox): escludi cestino e inviate (legacy senza folder = inbox)
+        filt["folder"] = {"$nin": ["trash", "sent"]}
     if unread is True:
         filt["flags.seen"] = False
     if pec is True:
