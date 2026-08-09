@@ -11,6 +11,7 @@ import {
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
 import { api, Account } from '@/src/services/api';
+import { OAUTH_KEY } from '@/src/page/page-oauth/OAuthCallback';
 
 type Provider = 'gmail' | 'outlook' | 'aruba' | 'legalmail' | 'postecert' | 'intesi' | 'other';
 
@@ -93,6 +94,11 @@ export default function Accounts() {
   const [customHost, setCustomHost] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [oauthBusy, setOauthBusy] = useState<'google' | 'microsoft' | null>(null);
+  const [oauthCfg, setOauthCfg] = useState<{
+    google: boolean;
+    microsoft: boolean;
+  }>({ google: false, microsoft: false });
 
   useEffect(() => {
     if (!isReady) return;
@@ -109,8 +115,74 @@ export default function Accounts() {
   useFocusEffect(
     useCallback(() => {
       load().catch((e) => setStatus({ ok: false, text: e.message }));
+      api
+        .oauthStatus()
+        .then((s) =>
+          setOauthCfg({
+            google: !!s.google?.configured,
+            microsoft: !!s.microsoft?.configured,
+          }),
+        )
+        .catch(() => undefined);
     }, [load]),
   );
+
+  const startOauth = async (providerOauth: 'google' | 'microsoft') => {
+    if (!userEmail || !masterPassword) return;
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      setStatus({
+        ok: false,
+        text: 'OAuth Google/Microsoft è disponibile nella versione web / PWA.',
+      });
+      return;
+    }
+    if (providerOauth === 'google' && !oauthCfg.google) {
+      setStatus({
+        ok: false,
+        text: 'OAuth Google non configurato sul server.',
+      });
+      return;
+    }
+    if (providerOauth === 'microsoft' && !oauthCfg.microsoft) {
+      setStatus({
+        ok: false,
+        text: 'OAuth Microsoft non configurato sul server (manca CLIENT_ID/SECRET).',
+      });
+      return;
+    }
+    setOauthBusy(providerOauth);
+    setStatus({
+      ok: true,
+      text:
+        providerOauth === 'google'
+          ? 'Reindirizzamento a Google…'
+          : 'Reindirizzamento a Microsoft…',
+    });
+    try {
+      const pending = {
+        email: userEmail,
+        master_password: masterPassword,
+        provider: providerOauth,
+      };
+      const raw = JSON.stringify(pending);
+      try {
+        sessionStorage.setItem(OAUTH_KEY, raw);
+        localStorage.setItem(OAUTH_KEY, raw);
+      } catch {
+        /* ignore */
+      }
+      const { authorize_url } = await api.oauthStart(
+        providerOauth,
+        userEmail,
+        masterPassword,
+      );
+      window.location.assign(authorize_url);
+    } catch (e: any) {
+      setOauthBusy(null);
+      setStatus({ ok: false, text: e?.message || 'Avvio OAuth fallito' });
+      notify('OAuth', e?.message || 'Avvio OAuth fallito');
+    }
+  };
 
   const isPec =
     provider === 'aruba' ||
@@ -308,7 +380,44 @@ export default function Accounts() {
         </TouchableOpacity>
       ))}
 
-      <Text style={styles.section}>{editingId ? 'Modifica casella' : 'Aggiungi casella (IMAP / PEC)'}</Text>
+      <Text style={styles.section}>Collega con OAuth</Text>
+      <Text style={styles.hint}>
+        Consigliato per Gmail e Outlook: niente App Password, accesso sicuro con il tuo account.
+      </Text>
+      <TouchableOpacity
+        style={[styles.oauthBtn, styles.oauthGoogle, (!oauthCfg.google || oauthBusy) && styles.oauthDisabled]}
+        onPress={() => startOauth('google')}
+        disabled={!!oauthBusy || !oauthCfg.google}
+      >
+        <Text style={styles.oauthBtnText}>
+          {oauthBusy === 'google'
+            ? 'Apertura Google…'
+            : oauthCfg.google
+              ? 'Collega Gmail (Google)'
+              : 'Google OAuth non configurato'}
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[
+          styles.oauthBtn,
+          styles.oauthMs,
+          (!oauthCfg.microsoft || oauthBusy) && styles.oauthDisabled,
+        ]}
+        onPress={() => startOauth('microsoft')}
+        disabled={!!oauthBusy || !oauthCfg.microsoft}
+      >
+        <Text style={styles.oauthBtnText}>
+          {oauthBusy === 'microsoft'
+            ? 'Apertura Microsoft…'
+            : oauthCfg.microsoft
+              ? 'Collega Outlook (Microsoft)'
+              : 'Microsoft OAuth non configurato'}
+        </Text>
+      </TouchableOpacity>
+
+      <Text style={styles.section}>
+        {editingId ? 'Modifica casella' : 'Oppure aggiungi con IMAP / App Password / PEC'}
+      </Text>
       {editingId ? (
         <TouchableOpacity onPress={resetForm}>
           <Text style={[styles.link, { marginBottom: 10 }]}>Annulla modifica / nuova casella</Text>
@@ -415,6 +524,16 @@ const styles = StyleSheet.create({
   rowBtns: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 },
   danger: { color: '#ff6b6b' },
   section: { color: '#4ecdc4', marginTop: 20, marginBottom: 10, fontWeight: '700' },
+  oauthBtn: {
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  oauthGoogle: { backgroundColor: '#ea4335' },
+  oauthMs: { backgroundColor: '#0078d4' },
+  oauthDisabled: { opacity: 0.45 },
+  oauthBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 8 },
   chip: {
     paddingHorizontal: 12,

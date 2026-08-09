@@ -5,7 +5,6 @@ import { api } from '@/src/services/api';
 import {
   enablePushNotifications,
   registerServiceWorker,
-  sendPushTestOnce,
   type PushEnableResult,
 } from '@/src/services/push';
 import {
@@ -45,8 +44,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setMasterPassword(session.masterPassword);
             setIsReady(true);
           }
-          // Notifica di prova all'accesso (sessione già sbloccata) — una volta / tab
-          sendPushTestOnce(session.email, session.masterPassword).catch(() => undefined);
           return;
         }
       }
@@ -90,13 +87,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await AsyncStorage.setItem(EMAIL_KEY, email);
     if (Platform.OS === 'web') {
       writeVaultSession(email, password);
-      // enablePushNotifications include già /push/test; se fallisce, prova solo il test
-      void (async () => {
-        const res = await enablePushNotifications(email, password).catch(() => null);
-        if (!res?.ok) {
-          await sendPushTestOnce(email, password, { force: true }).catch(() => undefined);
-        }
-      })();
+      // Solo subscription push — niente notifica di prova
+      enablePushNotifications(email, password).catch(() => undefined);
     }
   }, []);
 
@@ -126,13 +118,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setMasterPassword(null);
     setUserEmail(null);
     clearVaultSession();
-    if (typeof sessionStorage !== 'undefined') {
-      try {
-        sessionStorage.removeItem('mm_push_test_sent');
-      } catch (_) {
-        /* ignore */
-      }
-    }
   }, []);
 
   const value = useMemo(

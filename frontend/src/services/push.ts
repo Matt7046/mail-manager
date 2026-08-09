@@ -221,71 +221,8 @@ export async function enablePushNotifications(
     };
   }
 
-  // Prova immediata: conferma che FCM/APNs consegnano anche a PWA in background
-  let testNote = '';
-  const tested = await sendPushTest(email, masterPassword);
-  if (tested) {
-    markPushTestSent(email);
-    testNote =
-      ' Dovresti vedere subito una notifica di prova (chiudi l’app e attendi le nuove email).';
-  } else {
-    testNote =
-      ' Subscription salvata, ma il test push non è andato a buon fine: ricarica e ritocca Notifiche.';
-  }
-
   const tip = isIosDevice()
     ? 'Notifiche attivate. Su iPhone usa la PWA dalla Home; lascia Safari/Chrome non in Force Quit.'
     : 'Notifiche attivate su questo dispositivo (Web Push server-side).';
-  return { ok: true, message: tip + testNote };
-}
-
-const PUSH_TEST_SESSION_KEY = 'mm_push_test_sent';
-
-function markPushTestSent(email: string) {
-  if (typeof sessionStorage === 'undefined') return;
-  try {
-    sessionStorage.setItem(PUSH_TEST_SESSION_KEY, email.toLowerCase());
-  } catch (_) {
-    /* ignore */
-  }
-}
-
-function wasPushTestSent(email: string): boolean {
-  if (typeof sessionStorage === 'undefined') return false;
-  try {
-    return sessionStorage.getItem(PUSH_TEST_SESSION_KEY) === email.toLowerCase();
-  } catch (_) {
-    return false;
-  }
-}
-
-/** Invoca /api/push/test (richiede subscription già salvata). */
-export async function sendPushTest(email: string, masterPassword: string): Promise<boolean> {
-  try {
-    const testRes = await fetch(`${apiBase()}/api/push/test`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, master_password: masterPassword }),
-    });
-    const testData = await testRes.json().catch(() => ({}));
-    return !!(testRes.ok && (testData as any).ok);
-  } catch (_) {
-    return false;
-  }
-}
-
-/**
- * Notifica di prova una sola volta per sessione browser (login / restore vault).
- * Non richiede gesto utente se la subscription esiste già.
- * `force: true` su login esplicito (reinvia anche se già inviata in questa tab).
- */
-export async function sendPushTestOnce(
-  email: string,
-  masterPassword: string,
-  opts?: { force?: boolean },
-): Promise<boolean> {
-  if (!opts?.force && wasPushTestSent(email)) return true;
-  const ok = await sendPushTest(email, masterPassword);
-  if (ok) markPushTestSent(email);
-  return ok;
+  return { ok: true, message: tip };
 }

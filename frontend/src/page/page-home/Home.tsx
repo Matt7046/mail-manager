@@ -499,11 +499,11 @@ export default function Home() {
                 ? 'Sessione non attiva. Reindirizzamento al login…'
                 : folder === 'trash'
                   ? 'Cestino vuoto.'
-                  : folder === 'sent'
-                    ? onlyPec
-                      ? 'Nessuna PEC inviata con questi filtri.'
-                      : 'Nessuna email inviata.'
-                    : accounts.length === 0
+                : folder === 'sent'
+                  ? onlyPec
+                    ? 'Nessuna PEC inviata con questi filtri.'
+                    : 'Nessuna email inviata ancora. Scorri in basso per sincronizzare la cartella Sent dal provider.'
+                  : accounts.length === 0
                       ? 'Nessun account collegato. Apri Account e aggiungi una casella email.'
                       : onlyPec
                         ? 'Nessuna PEC ricevuta con questi filtri.'

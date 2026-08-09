@@ -210,6 +210,12 @@ class MessageAuthBody(BaseModel):
     master_password: str
 
 
+class AttachmentIn(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    content_base64: str
+
+
 class SendBody(BaseModel):
     email: EmailStr
     master_password: str
@@ -222,6 +228,7 @@ class SendBody(BaseModel):
     body_html: Optional[str] = None
     as_pec: bool = False
     reply_to_message_id: Optional[str] = None
+    attachments: List[AttachmentIn] = []
 
 
 class RuleBody(BaseModel):
@@ -1012,6 +1019,39 @@ async def send_message(body: SendBody):
     cc_addrs = [str(x).lower() for x in body.cc]
     bcc_addrs = [str(x).lower() for x in body.bcc]
 
+    # Limiti allegati (base64 in JSON)
+    MAX_ATT = 10
+    MAX_ONE = 12 * 1024 * 1024
+    MAX_ALL = 25 * 1024 * 1024
+    att_payload: List[Dict[str, Any]] = []
+    total_raw = 0
+    if len(body.attachments) > MAX_ATT:
+        raise HTTPException(400, f"Massimo {MAX_ATT} allegati per messaggio")
+    import base64 as _b64
+
+    for a in body.attachments:
+        name = (a.filename or "allegato").strip() or "allegato"
+        raw_b64 = (a.content_base64 or "").strip()
+        if raw_b64.startswith("data:") and "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        try:
+            raw = _b64.b64decode(raw_b64, validate=False)
+        except Exception as exc:
+            raise HTTPException(400, f"Allegato non valido ({name})") from exc
+        if len(raw) > MAX_ONE:
+            raise HTTPException(400, f"Allegato troppo grande ({name}): max 12 MB")
+        total_raw += len(raw)
+        if total_raw > MAX_ALL:
+            raise HTTPException(400, "Dimensione totale allegati oltre 25 MB")
+        att_payload.append(
+            {
+                "filename": name,
+                "content_type": a.content_type or "application/octet-stream",
+                "content_base64": raw_b64,
+                "size": len(raw),
+            }
+        )
+
     try:
         await asyncio.to_thread(
             mail_provider.send_smtp,
@@ -1029,6 +1069,7 @@ async def send_message(body: SendBody):
             use_ssl=use_ssl,
             starttls=starttls,
             access_token=access_token,
+            attachments=att_payload,
         )
         send_status = "sent"
         send_error = None
@@ -1048,6 +1089,15 @@ async def send_message(body: SendBody):
             }
         )
 
+    att_meta = [
+        {
+            "filename": a["filename"],
+            "content_type": a["content_type"],
+            "size": a["size"],
+        }
+        for a in att_payload
+    ]
+
     doc = {
         "user_email": email,
         "account_id": body.account_id,
@@ -1058,8 +1108,8 @@ async def send_message(body: SendBody):
         "cc_addrs": cc_addrs,
         "date": now,
         "flags": {"seen": True, "flagged": False, "archived": False},
-        "has_attachments": False,
-        "attachments": [],
+        "has_attachments": bool(att_meta),
+        "attachments": att_meta,
         "is_pec": bool(body.as_pec or acc.get("type") == "pec"),
         "snippet": (body.body_text or "")[:160],
         "body_enc": encrypt_secret(body.body_text or "", email),
@@ -1191,26 +1241,44 @@ async def sync_accounts_for_user(
                 access_token=access_token,
             )
             for m in fetched:
+                src_folder = (m.get("folder") or "INBOX").lower()
+                is_sent = src_folder == "sent"
                 lookup = {
                     "user_email": email_l,
                     "account_id": aid,
                     "imap_uid": m["imap_uid"],
                 }
-                # match inbox/trash/legacy — non toccare messaggi "sent"
-                existing = await db.messages.find_one(
-                    {
-                        **lookup,
-                        "$or": [
-                            {"folder": {"$in": ["INBOX", "trash"]}},
-                            {"folder": {"$exists": False}},
-                            {"folder": None},
-                        ],
-                    }
-                )
-                folder = "INBOX"
-                if existing and (existing.get("folder") or "").lower() == "trash":
-                    # non riportare in inbox messaggi già nel cestino
-                    folder = "trash"
+                if is_sent:
+                    # Cartella Inviate (IMAP Sent + eventuali duplicate da compose)
+                    existing = await db.messages.find_one(
+                        {**lookup, "folder": "sent"}
+                    )
+                    if not existing and m.get("message_id"):
+                        existing = await db.messages.find_one(
+                            {
+                                "user_email": email_l,
+                                "account_id": aid,
+                                "folder": "sent",
+                                "message_id": m["message_id"],
+                            }
+                        )
+                    folder = "sent"
+                else:
+                    # match inbox/trash/legacy — non toccare messaggi "sent"
+                    existing = await db.messages.find_one(
+                        {
+                            **lookup,
+                            "$or": [
+                                {"folder": {"$in": ["INBOX", "trash"]}},
+                                {"folder": {"$exists": False}},
+                                {"folder": None},
+                            ],
+                        }
+                    )
+                    folder = "INBOX"
+                    if existing and (existing.get("folder") or "").lower() == "trash":
+                        # non riportare in inbox messaggi già nel cestino
+                        folder = "trash"
                 payload = {
                     **lookup,
                     "folder": folder,
@@ -1235,16 +1303,18 @@ async def sync_accounts_for_user(
                 else:
                     payload["created_at"] = datetime.utcnow()
                     await db.messages.insert_one(payload)
-                    inserted += 1
-                    if len(new_previews) < 5:
-                        new_previews.append(
-                            {
-                                "subject": (m.get("subject") or "(senza oggetto)")[:80],
-                                "from": (m.get("from_addr") or "")[:60],
-                                "is_pec": "1" if m.get("is_pec") else "0",
-                                "account": acc.get("label") or acc.get("address") or "",
-                            }
-                        )
+                    # Push solo per nuove ricevute, non per sync Sent
+                    if not is_sent:
+                        inserted += 1
+                        if len(new_previews) < 5:
+                            new_previews.append(
+                                {
+                                    "subject": (m.get("subject") or "(senza oggetto)")[:80],
+                                    "from": (m.get("from_addr") or "")[:60],
+                                    "is_pec": "1" if m.get("is_pec") else "0",
+                                    "account": acc.get("label") or acc.get("address") or "",
+                                }
+                            )
             synced += 1
             await db.accounts.update_one(
                 {"_id": acc["_id"]},
@@ -1437,36 +1507,9 @@ class PushTestBody(BaseModel):
 
 
 @api.post("/push/test")
-async def push_test(body: PushTestBody):
-    """Invia una notifica di prova a tutte le subscription dell'utente (debug Android)."""
-    email = body.email.lower()
-    await require_user(email, body.master_password)
-    if not push_notify.vapid_configured():
-        raise HTTPException(503, "Web Push non configurato")
-    subs = await _load_push_subs(email)
-    if not subs:
-        raise HTTPException(404, "Nessuna subscription push salvata. Tocca Notifiche e riprova.")
-    dead, ok, fail = push_notify.notify_new_mail(
-        subs,
-        title="Mail Manager",
-        body="Notifica di prova — se la vedi a app chiusa, il push funziona.",
-        url="/",
-        tag="push-test",
-    )
-    await _purge_dead_push_subs(email, dead)
-    return {
-        "ok": ok > 0,
-        "sent_ok": ok,
-        "sent_fail": fail,
-        "removed_expired": len(dead),
-        "subscriptions": len(subs),
-        "message": (
-            "Notifica di prova inviata."
-            if ok > 0
-            else "Invio fallito (subscription scadute o errore FCM). Ritocca Notifiche."
-        ),
-    }
-
+async def push_test(_body: PushTestBody):
+    """Disabilitato: la notifica di prova non viene piu inviata."""
+    raise HTTPException(410, "Notifica di prova disabilitata")
 
 @api.delete("/push/subscribe")
 async def push_unsubscribe(email: EmailStr, master_password: str, endpoint: str):

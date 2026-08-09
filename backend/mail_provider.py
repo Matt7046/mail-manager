@@ -10,9 +10,11 @@ import re
 import smtplib
 import ssl
 from datetime import datetime, timezone
-from email.message import EmailMessage
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
+import base64 as b64mod
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("mail-manager.provider")
@@ -312,6 +314,145 @@ def test_imap(
             pass
 
 
+_SENT_CANDIDATES = (
+    "[Gmail]/Sent Mail",
+    "[Google Mail]/Sent Mail",
+    "Sent",
+    "Sent Items",
+    "Sent Messages",
+    "INBOX.Sent",
+    "INBOX/Sent",
+    "Posta inviata",
+    "Elementi inviati",
+)
+
+
+def _decode_mailbox_name(raw) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, tuple) and len(raw) >= 3:
+        name = raw[2]
+        if isinstance(name, bytes):
+            return name.decode("utf-8", errors="replace")
+        return str(name)
+    line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    m = re.search(r'"([^"]+)"\s*$', line)
+    if m:
+        return m.group(1)
+    parts = line.split()
+    return parts[-1].strip('"') if parts else None
+
+
+def list_mailbox_names(client: imaplib.IMAP4) -> List[str]:
+    names: List[str] = []
+    try:
+        typ, data = client.list()
+    except Exception as exc:
+        log.warning("IMAP LIST fallito: %s", exc)
+        return names
+    if typ != "OK" or not data:
+        return names
+    for row in data:
+        name = _decode_mailbox_name(row)
+        if name:
+            names.append(name)
+    return names
+
+
+def resolve_sent_mailbox(client: imaplib.IMAP4) -> Optional[str]:
+    boxes = list_mailbox_names(client)
+    if not boxes:
+        for cand in _SENT_CANDIDATES:
+            typ, _ = client.select(cand, readonly=True)
+            if typ == "OK":
+                return cand
+        return None
+    lower_map = {b.lower(): b for b in boxes}
+    for cand in _SENT_CANDIDATES:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    for b in boxes:
+        bl = b.lower()
+        if "sent mail" in bl or bl.endswith("/sent") or bl.endswith(".sent"):
+            return b
+        if bl in ("sent", "sent items", "posta inviata", "elementi inviati"):
+            return b
+        if "sent" in bl and "spam" not in bl and "trash" not in bl and "bin" not in bl:
+            return b
+    return None
+
+
+def _fetch_from_selected(
+    client: imaplib.IMAP4,
+    *,
+    folder_label: str,
+    limit: int,
+    account_type: str,
+) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    typ, data = client.search(None, "ALL")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    ids = data[0].split()
+    ids = ids[-limit:]
+    ids.reverse()  # newest first
+    for num in ids:
+        typ, msg_data = client.fetch(num, "(RFC822 FLAGS UID)")
+        if typ != "OK" or not msg_data:
+            continue
+        raw = None
+        flags_raw = b""
+        uid = num.decode() if isinstance(num, bytes) else str(num)
+        for item in msg_data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                meta = item[0] if isinstance(item[0], (bytes, bytearray)) else b""
+                raw = item[1]
+                flags_raw = meta
+                m_uid = re.search(rb"UID\s+(\d+)", meta)
+                if m_uid:
+                    uid = m_uid.group(1).decode()
+        if not raw:
+            continue
+        msg = email.message_from_bytes(raw)
+        text_body, html_body = _extract_body(msg)
+        seen = b"\\Seen" in flags_raw
+        flagged = b"\\Flagged" in flags_raw
+        message_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+        attachments = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                disp = str(part.get("Content-Disposition") or "")
+                if "attachment" in disp.lower() or part.get_filename():
+                    attachments.append(
+                        {
+                            "filename": _decode_header(part.get_filename()) or "file",
+                            "content_type": part.get_content_type(),
+                        }
+                    )
+        messages.append(
+            {
+                "imap_uid": uid,
+                "message_id": message_id,
+                "subject": _decode_header(msg.get("Subject")) or "(senza oggetto)",
+                "from_addr": _parse_addrs(msg.get("From"))[0]
+                if _parse_addrs(msg.get("From"))
+                else _decode_header(msg.get("From")),
+                "to_addrs": _parse_addrs(msg.get("To")),
+                "cc_addrs": _parse_addrs(msg.get("Cc")),
+                "date": _msg_date(msg),
+                "flags": {"seen": seen, "flagged": flagged, "archived": False},
+                "has_attachments": bool(attachments),
+                "attachments": attachments,
+                "is_pec": _looks_like_pec(msg, account_type),
+                "snippet": (text_body or "")[:180],
+                "body_text": text_body,
+                "body_html": html_body,
+                "folder": folder_label,
+            }
+        )
+    return messages
+
+
 def fetch_inbox(
     host: str,
     port: int,
@@ -322,7 +463,10 @@ def fetch_inbox(
     account_type: str = "imap",
     provider_hint: Optional[str] = None,
     access_token: Optional[str] = None,
+    include_sent: bool = True,
+    sent_limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Scarica INBOX e (opzionale) cartella Sent/Inviate dal provider."""
     client, _used = connect_mailbox(
         host,
         port,
@@ -336,73 +480,35 @@ def fetch_inbox(
         typ, _ = client.select("INBOX", readonly=True)
         if typ != "OK":
             raise RuntimeError("Impossibile aprire INBOX")
-        typ, data = client.search(None, "ALL")
-        if typ != "OK" or not data or not data[0]:
-            return []
-        ids = data[0].split()
-        ids = ids[-limit:]
-        ids.reverse()  # newest first
-        for num in ids:
-            typ, msg_data = client.fetch(num, "(RFC822 FLAGS UID)")
-            if typ != "OK" or not msg_data:
-                continue
-            raw = None
-            flags_raw = b""
-            uid = num.decode() if isinstance(num, bytes) else str(num)
-            for item in msg_data:
-                if isinstance(item, tuple) and len(item) >= 2:
-                    meta = item[0] if isinstance(item[0], (bytes, bytearray)) else b""
-                    raw = item[1]
-                    flags_raw = meta
-                    m_uid = re.search(rb"UID\s+(\d+)", meta)
-                    if m_uid:
-                        uid = m_uid.group(1).decode()
-            if not raw:
-                continue
-            msg = email.message_from_bytes(raw)
-            text_body, html_body = _extract_body(msg)
-            seen = b"\\Seen" in flags_raw
-            flagged = b"\\Flagged" in flags_raw
-            message_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
-            attachments = []
-            if msg.is_multipart():
-                for part in msg.walk():
-                    disp = str(part.get("Content-Disposition") or "")
-                    if "attachment" in disp.lower() or part.get_filename():
-                        attachments.append(
-                            {
-                                "filename": _decode_header(part.get_filename()) or "file",
-                                "content_type": part.get_content_type(),
-                            }
-                        )
-            messages.append(
-                {
-                    "imap_uid": uid,
-                    "message_id": message_id,
-                    "subject": _decode_header(msg.get("Subject")) or "(senza oggetto)",
-                    "from_addr": _parse_addrs(msg.get("From"))[0]
-                    if _parse_addrs(msg.get("From"))
-                    else _decode_header(msg.get("From")),
-                    "to_addrs": _parse_addrs(msg.get("To")),
-                    "cc_addrs": _parse_addrs(msg.get("Cc")),
-                    "date": _msg_date(msg),
-                    "flags": {"seen": seen, "flagged": flagged, "archived": False},
-                    "has_attachments": bool(attachments),
-                    "attachments": attachments,
-                    "is_pec": _looks_like_pec(msg, account_type),
-                    "snippet": (text_body or "")[:180],
-                    "body_text": text_body,
-                    "body_html": html_body,
-                    "folder": "INBOX",
-                }
+        messages.extend(
+            _fetch_from_selected(
+                client, folder_label="INBOX", limit=limit, account_type=account_type
             )
+        )
+        if include_sent:
+            sent_box = resolve_sent_mailbox(client)
+            if sent_box:
+                typ, _ = client.select(sent_box, readonly=True)
+                if typ == "OK":
+                    messages.extend(
+                        _fetch_from_selected(
+                            client,
+                            folder_label="sent",
+                            limit=sent_limit if sent_limit is not None else limit,
+                            account_type=account_type,
+                        )
+                    )
+                    log.info("Sync Sent mailbox=%s count_limit=%s", sent_box, sent_limit or limit)
+                else:
+                    log.info("SELECT Sent fallito mailbox=%s", sent_box)
+            else:
+                log.info("Nessuna mailbox Sent trovata per %s", user)
         return messages
     finally:
         try:
             client.logout()
         except Exception:
             pass
-
 
 def send_smtp(
     *,
@@ -420,32 +526,49 @@ def send_smtp(
     use_ssl: bool = True,
     starttls: bool = False,
     access_token: Optional[str] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     cc_addrs = cc_addrs or []
     bcc_addrs = bcc_addrs or []
+    attachments = attachments or []
     recipients = list(dict.fromkeys([*to_addrs, *cc_addrs, *bcc_addrs]))
     if not recipients:
         raise ValueError("Nessun destinatario")
 
+    root = MIMEMultipart("mixed")
+    root["Subject"] = subject
+    root["From"] = from_addr
+    root["To"] = ", ".join(to_addrs)
+    if cc_addrs:
+        root["Cc"] = ", ".join(cc_addrs)
+
     if body_html:
-        msg: EmailMessage | MIMEMultipart = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = from_addr
-        msg["To"] = ", ".join(to_addrs)
-        if cc_addrs:
-            msg["Cc"] = ", ".join(cc_addrs)
-        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
-        msg.attach(MIMEText(body_html, "html", "utf-8"))
-        payload = msg.as_string()
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body_text or "", "plain", "utf-8"))
+        alt.attach(MIMEText(body_html, "html", "utf-8"))
+        root.attach(alt)
     else:
-        msg2 = EmailMessage()
-        msg2["Subject"] = subject
-        msg2["From"] = from_addr
-        msg2["To"] = ", ".join(to_addrs)
-        if cc_addrs:
-            msg2["Cc"] = ", ".join(cc_addrs)
-        msg2.set_content(body_text or "")
-        payload = msg2.as_string()
+        root.attach(MIMEText(body_text or "", "plain", "utf-8"))
+
+    for att in attachments:
+        filename = (att.get("filename") or "allegato").strip() or "allegato"
+        ctype = (att.get("content_type") or "application/octet-stream").strip()
+        raw_b64 = att.get("content_base64") or ""
+        try:
+            raw = b64mod.b64decode(raw_b64, validate=False)
+        except Exception as exc:
+            raise ValueError(f"Allegato non valido ({filename}): {exc}") from exc
+        if "/" in ctype:
+            maintype, subtype = ctype.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(raw)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        root.attach(part)
+
+    payload = root.as_string()
 
     ctx = ssl.create_default_context()
     pwd = normalize_mailbox_secret(password)
@@ -474,4 +597,8 @@ def send_smtp(
             _login(smtp)
             smtp.sendmail(from_addr, recipients, payload)
 
-    return {"ok": True, "recipients": recipients}
+    return {
+        "ok": True,
+        "recipients": recipients,
+        "attachments": len(attachments),
+    }
