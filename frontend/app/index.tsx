@@ -2,7 +2,7 @@ import { Redirect } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, View } from 'react-native';
 import { useAuth } from '@/src/contexts/AuthContext';
-import { api } from '@/src/services/api';
+import { oauthCallbackPathFromQuery } from '@/src/lib/oauthStrayRedirect';
 
 export default function Index() {
   const { masterPassword, bootstrap } = useAuth();
@@ -10,14 +10,19 @@ export default function Index() {
 
   useEffect(() => {
     (async () => {
+      const oauthPath = oauthCallbackPathFromQuery();
+      if (oauthPath) {
+        setTarget(oauthPath);
+        return;
+      }
       if (masterPassword) {
         setTarget('/home');
         return;
       }
-      const check = await api.checkSetup();
       await bootstrap();
-      setTarget(check.setup_done ? '/login' : '/setup');
-    })().catch(() => setTarget('/setup'));
+      // Always show login (Accedi + Crea nuovo account) — never force setup alone.
+      setTarget('/login');
+    })().catch(() => setTarget('/login'));
   }, [masterPassword, bootstrap]);
 
   if (!target) {

@@ -20,10 +20,12 @@ from fastapi import FastAPI, APIRouter, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
+from pymongo.errors import DuplicateKeyError
 from starlette.middleware.cors import CORSMiddleware
 
 import mail_provider
 import oauth_mail
+import push_notify
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -167,6 +169,14 @@ class OAuthCompleteBody(BaseModel):
     state: str
 
 
+class PushSubscribeBody(BaseModel):
+    email: EmailStr
+    master_password: str
+    endpoint: str
+    keys: Dict[str, str]
+    expiration_time: Optional[float] = None
+
+
 def public_account(doc: dict) -> AccountOut:
     return AccountOut(
         id=str(doc["_id"]),
@@ -193,6 +203,11 @@ class MessageFlagsBody(BaseModel):
     seen: Optional[bool] = None
     flagged: Optional[bool] = None
     archived: Optional[bool] = None
+
+
+class MessageAuthBody(BaseModel):
+    email: EmailStr
+    master_password: str
 
 
 class SendBody(BaseModel):
@@ -334,19 +349,52 @@ async def check_setup(email: Optional[str] = None):
     return {"setup_done": await db.users.count_documents({}) > 0, "email": ""}
 
 
+async def dedupe_users_by_email() -> int:
+    """Keep oldest vault user per email; delete later duplicates."""
+    pipeline = [
+        {"$addFields": {"email_norm": {"$toLower": {"$ifNull": ["$email", ""]}}}},
+        {"$match": {"email_norm": {"$ne": ""}}},
+        {"$sort": {"created_at": 1, "_id": 1}},
+        {
+            "$group": {
+                "_id": "$email_norm",
+                "keep_id": {"$first": "$_id"},
+                "all_ids": {"$push": "$_id"},
+                "count": {"$sum": 1},
+            }
+        },
+        {"$match": {"count": {"$gt": 1}}},
+    ]
+    removed = 0
+    async for group in db.users.aggregate(pipeline):
+        dup_ids = [oid for oid in group["all_ids"] if oid != group["keep_id"]]
+        if not dup_ids:
+            continue
+        result = await db.users.delete_many({"_id": {"$in": dup_ids}})
+        removed += result.deleted_count
+        await db.users.update_one(
+            {"_id": group["keep_id"]},
+            {"$set": {"email": group["_id"]}},
+        )
+    return removed
+
+
 @api.post("/auth/setup", response_model=AuthOk)
 async def setup(body: SetupBody):
     email = body.email.lower()
-    if await db.users.find_one({"email": email}):
-        raise HTTPException(400, "Utente già registrato")
-    await db.users.insert_one(
-        {
-            "email": email,
-            "password_hash": pwd_context.hash(body.master_password),
-            "created_at": datetime.utcnow(),
-            "biometric_hint": False,
-        }
-    )
+    if await db.users.find_one({"email": email}, sort=[("created_at", 1), ("_id", 1)]):
+        raise HTTPException(400, "Questa email è già registrata. Accedi invece.")
+    try:
+        await db.users.insert_one(
+            {
+                "email": email,
+                "password_hash": pwd_context.hash(body.master_password),
+                "created_at": datetime.utcnow(),
+                "biometric_hint": False,
+            }
+        )
+    except DuplicateKeyError:
+        raise HTTPException(400, "Questa email è già registrata. Accedi invece.")
     return AuthOk(email=email, message="Vault creato")
 
 
@@ -696,6 +744,7 @@ async def list_messages(
     q: Optional[str] = None,
     unread: Optional[bool] = None,
     pec: Optional[bool] = None,
+    folder: Optional[str] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
 ):
@@ -703,6 +752,14 @@ async def list_messages(
     filt: Dict[str, Any] = {"user_email": email.lower()}
     if account:
         filt["account_id"] = account
+    folder_l = (folder or "inbox").lower()
+    if folder_l == "trash":
+        filt["folder"] = "trash"
+    elif folder_l == "sent":
+        filt["folder"] = "sent"
+    else:
+        # inbox / default: escludi cestino ($ne matcha anche messaggi legacy senza folder)
+        filt["folder"] = {"$ne": "trash"}
     if unread is True:
         filt["flags.seen"] = False
     if pec is True:
@@ -736,6 +793,7 @@ async def list_messages(
                 "is_pec": m.get("is_pec", False),
                 "snippet": m.get("snippet", ""),
                 "priority": m.get("priority"),
+                "folder": m.get("folder") or "INBOX",
             }
         )
     return {"items": items, "page": page, "total": total}
@@ -776,7 +834,76 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
         "body_html": m.get("body_html"),
         "receipts": m.get("receipts", []),
         "priority": m.get("priority"),
+        "folder": m.get("folder") or "INBOX",
     }
+
+
+@api.post("/messages/{message_id}/trash")
+async def trash_message(message_id: str, body: MessageAuthBody):
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    email_l = body.email.lower()
+    await require_user(email_l, body.master_password)
+    try:
+        oid = ObjectId(message_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "ID non valido") from exc
+    res = await db.messages.update_one(
+        {"_id": oid, "user_email": email_l},
+        {"$set": {"folder": "trash", "updated_at": datetime.utcnow()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(404, "Messaggio non trovato")
+    return {"ok": True, "folder": "trash"}
+
+
+@api.post("/messages/{message_id}/restore")
+async def restore_message(message_id: str, body: MessageAuthBody):
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    email_l = body.email.lower()
+    await require_user(email_l, body.master_password)
+    try:
+        oid = ObjectId(message_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "ID non valido") from exc
+    m = await db.messages.find_one({"_id": oid, "user_email": email_l})
+    if not m:
+        raise HTTPException(404, "Messaggio non trovato")
+    if (m.get("folder") or "").lower() != "trash":
+        raise HTTPException(400, "Il messaggio non è nel cestino")
+    await db.messages.update_one(
+        {"_id": oid},
+        {"$set": {"folder": "INBOX", "updated_at": datetime.utcnow()}},
+    )
+    return {"ok": True, "folder": "INBOX"}
+
+
+@api.delete("/messages/{message_id}")
+async def delete_message_permanent(
+    message_id: str, email: EmailStr, master_password: str
+):
+    """Eliminazione definitiva (consentita solo dal cestino)."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    email_l = email.lower()
+    await require_user(email_l, master_password)
+    try:
+        oid = ObjectId(message_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "ID non valido") from exc
+    m = await db.messages.find_one({"_id": oid, "user_email": email_l})
+    if not m:
+        raise HTTPException(404, "Messaggio non trovato")
+    if (m.get("folder") or "").lower() != "trash":
+        raise HTTPException(
+            400, "Sposta prima il messaggio nel cestino per eliminarlo definitivamente"
+        )
+    await db.messages.delete_one({"_id": oid})
+    return {"ok": True}
 
 
 @api.post("/messages/{message_id}/flags")
@@ -979,15 +1106,17 @@ async def create_rule(body: RuleBody):
 # --- sync ---
 
 
-@api.post("/sync/run")
-async def sync_run(email: EmailStr, master_password: str, account_id: Optional[str] = None):
-    """Scarica INBOX via IMAP e upserta i messaggi."""
+async def sync_accounts_for_user(
+    email_l: str,
+    account_id: Optional[str] = None,
+    *,
+    notify: bool = True,
+) -> Dict[str, Any]:
+    """Sync IMAP per un vault user. Usato da API e worker periodico."""
     import asyncio
     from bson import ObjectId
     from bson.errors import InvalidId
 
-    email_l = email.lower()
-    await require_user(email_l, master_password)
     filt: Dict[str, Any] = {"user_email": email_l}
     if account_id:
         try:
@@ -998,6 +1127,8 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
     synced = 0
     inserted = 0
     errors: List[str] = []
+    new_previews: List[Dict[str, str]] = []
+
     async for acc in db.accounts.find(filt):
         aid = str(acc["_id"])
         await db.accounts.update_one(
@@ -1011,21 +1142,35 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
                 int(acc.get("imap_port") or 993),
                 user,
                 pwd or "",
-                limit=80,
+                limit=100,
                 account_type=acc.get("type") or "imap",
                 provider_hint=acc.get("pec_provider") or acc.get("type"),
                 access_token=access_token,
             )
             for m in fetched:
-                key = {
+                lookup = {
                     "user_email": email_l,
                     "account_id": aid,
                     "imap_uid": m["imap_uid"],
-                    "folder": "INBOX",
                 }
-                existing = await db.messages.find_one(key)
+                # match inbox/trash/legacy — non toccare messaggi "sent"
+                existing = await db.messages.find_one(
+                    {
+                        **lookup,
+                        "$or": [
+                            {"folder": {"$in": ["INBOX", "trash"]}},
+                            {"folder": {"$exists": False}},
+                            {"folder": None},
+                        ],
+                    }
+                )
+                folder = "INBOX"
+                if existing and (existing.get("folder") or "").lower() == "trash":
+                    # non riportare in inbox messaggi già nel cestino
+                    folder = "trash"
                 payload = {
-                    **key,
+                    **lookup,
+                    "folder": folder,
                     "message_id": m.get("message_id"),
                     "subject": m.get("subject", ""),
                     "from_addr": m.get("from_addr", ""),
@@ -1048,6 +1193,15 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
                     payload["created_at"] = datetime.utcnow()
                     await db.messages.insert_one(payload)
                     inserted += 1
+                    if len(new_previews) < 5:
+                        new_previews.append(
+                            {
+                                "subject": (m.get("subject") or "(senza oggetto)")[:80],
+                                "from": (m.get("from_addr") or "")[:60],
+                                "is_pec": "1" if m.get("is_pec") else "0",
+                                "account": acc.get("label") or acc.get("address") or "",
+                            }
+                        )
             synced += 1
             await db.accounts.update_one(
                 {"_id": acc["_id"]},
@@ -1057,6 +1211,18 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
                         "last_sync_at": datetime.utcnow(),
                         "last_sync_error": None,
                         "last_sync_count": len(fetched),
+                    }
+                },
+            )
+        except HTTPException as exc:
+            errors.append(f"{acc.get('address')}: {exc.detail}")
+            await db.accounts.update_one(
+                {"_id": acc["_id"]},
+                {
+                    "$set": {
+                        "sync_state": "error",
+                        "last_sync_at": datetime.utcnow(),
+                        "last_sync_error": str(exc.detail),
                     }
                 },
             )
@@ -1074,14 +1240,61 @@ async def sync_run(email: EmailStr, master_password: str, account_id: Optional[s
                 },
             )
 
+    if notify and inserted > 0 and new_previews:
+        await notify_user_new_mail(email_l, inserted, new_previews)
+
     return {
         "accounts_synced": synced,
         "messages_inserted": inserted,
         "errors": errors,
+        "new_previews": new_previews,
         "message": "Sync IMAP completato"
         if not errors
         else "Sync completato con errori",
     }
+
+
+async def notify_user_new_mail(
+    email_l: str, inserted: int, previews: List[Dict[str, str]]
+) -> None:
+    if not push_notify.vapid_configured():
+        return
+    first = previews[0] if previews else {}
+    pec = first.get("is_pec") == "1"
+    title = "Nuova PEC" if pec and inserted == 1 else (
+        f"{inserted} nuove email" if inserted > 1 else "Nuova email"
+    )
+    body = first.get("subject") or "Hai ricevuto un nuovo messaggio"
+    if first.get("from"):
+        body = f"Da {first['from']}: {body}"
+    if first.get("account"):
+        body = f"[{first['account']}] {body}"
+
+    subs = []
+    async for s in db.push_subscriptions.find({"user_email": email_l}):
+        subs.append(
+            {
+                "endpoint": s["endpoint"],
+                "keys": s.get("keys") or {},
+            }
+        )
+    if not subs:
+        return
+    dead = push_notify.notify_new_mail(
+        subs, title=title, body=body[:180], url="/home", tag="new-mail"
+    )
+    if dead:
+        await db.push_subscriptions.delete_many(
+            {"user_email": email_l, "endpoint": {"$in": dead}}
+        )
+
+
+@api.post("/sync/run")
+async def sync_run(email: EmailStr, master_password: str, account_id: Optional[str] = None):
+    """Scarica INBOX via IMAP e upserta i messaggi."""
+    email_l = email.lower()
+    await require_user(email_l, master_password)
+    return await sync_accounts_for_user(email_l, account_id, notify=True)
 
 
 @api.get("/sync/status")
@@ -1095,6 +1308,7 @@ async def sync_status(email: EmailStr, master_password: str):
                 "address": acc["address"],
                 "sync_state": acc.get("sync_state", "idle"),
                 "last_sync_at": acc.get("last_sync_at"),
+                "last_sync_error": acc.get("last_sync_error"),
             }
         )
     outbox = await db.outbox.count_documents(
@@ -1103,72 +1317,166 @@ async def sync_status(email: EmailStr, master_password: str):
     return {"accounts": accounts, "outbox_queued": outbox}
 
 
+# --- web push ---
+
+
+@api.get("/push/vapid-public-key")
+async def push_vapid_public_key():
+    key = push_notify.get_vapid_public()
+    if not key:
+        raise HTTPException(503, "Web Push non configurato")
+    return {"publicKey": key}
+
+
+@api.post("/push/subscribe")
+async def push_subscribe(body: PushSubscribeBody):
+    email = body.email.lower()
+    await require_user(email, body.master_password)
+    if not body.endpoint or not body.keys.get("p256dh") or not body.keys.get("auth"):
+        raise HTTPException(400, "Subscription incompleta")
+    await db.push_subscriptions.update_one(
+        {"user_email": email, "endpoint": body.endpoint},
+        {
+            "$set": {
+                "user_email": email,
+                "endpoint": body.endpoint,
+                "keys": {
+                    "p256dh": body.keys["p256dh"],
+                    "auth": body.keys["auth"],
+                },
+                "expiration_time": body.expiration_time,
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@api.delete("/push/subscribe")
+async def push_unsubscribe(email: EmailStr, master_password: str, endpoint: str):
+    await require_user(email.lower(), master_password)
+    await db.push_subscriptions.delete_one(
+        {"user_email": email.lower(), "endpoint": endpoint}
+    )
+    return {"ok": True}
+
+
 @api.post("/dev/seed_demo")
 async def seed_demo(email: EmailStr, master_password: str):
-    """Inserisce messaggi demo (anche PEC) per provare la UI senza IMAP."""
+    """Disabilitato: i messaggi demo non sono più supportati."""
+    await require_user(email.lower(), master_password)
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        "Seed demo disabilitato. Usa /api/dev/purge_demo_messages per rimuovere i vecchi demo.",
+    )
+
+
+@api.post("/dev/purge_demo_messages")
+async def purge_demo_messages(email: EmailStr, master_password: str):
+    """Elimina messaggi demo (soggetti noti) per l'utente autenticato."""
     email_l = email.lower()
     await require_user(email_l, master_password)
-    acc = await db.accounts.find_one({"user_email": email_l})
-    if not acc:
-        raise HTTPException(400, "Aggiungi prima un account")
-    aid = str(acc["_id"])
-    now = datetime.utcnow()
-    samples = [
-        {
-            "subject": "Benvenuto in Mail Manager v2",
-            "from_addr": "noreply@colorsdev.tech",
-            "is_pec": False,
-            "snippet": "Inbox unificata pronta.",
-            "body": "Questo è un messaggio demo non PEC.",
-        },
-        {
-            "subject": "PEC: Avviso di prova",
-            "from_addr": "mittente@pec.example.it",
-            "is_pec": True,
-            "snippet": "Posta certificata di esempio.",
-            "body": "Corpo PEC demo.",
-            "receipts": [
-                {"type": "accettazione", "at": (now - timedelta(minutes=2)).isoformat() + "Z"},
-                {"type": "consegna", "at": now.isoformat() + "Z"},
-            ],
-        },
+    demo_subjects = [
+        "Benvenuto in Mail Manager",
+        "PEC: Avviso di prova",
     ]
-    ids = []
-    for s in samples:
-        doc = {
-            "user_email": email_l,
-            "account_id": aid,
-            "folder": "INBOX",
-            "subject": s["subject"],
-            "from_addr": s["from_addr"],
-            "to_addrs": [acc["address"]],
-            "cc_addrs": [],
-            "date": now,
-            "flags": {"seen": False, "flagged": False, "archived": False},
-            "has_attachments": False,
-            "attachments": [],
-            "is_pec": s["is_pec"],
-            "snippet": s["snippet"],
-            "body_enc": encrypt_secret(s["body"], email_l),
-            "receipts": s.get("receipts", []),
-            "priority": "high" if s["is_pec"] else None,
-            "created_at": now,
-        }
-        r = await db.messages.insert_one(doc)
-        ids.append(str(r.inserted_id))
-    return {"inserted": ids}
+    filt: Dict[str, Any] = {
+        "user_email": email_l,
+        "$or": [
+            {"subject": {"$regex": s, "$options": "i"}} for s in demo_subjects
+        ]
+        + [
+            {"from_addr": {"$regex": r"noreply@colorsdev\.tech", "$options": "i"}},
+            {"from_addr": {"$regex": r"mittente@pec\.example\.it", "$options": "i"}},
+        ],
+    }
+    res = await db.messages.delete_many(filt)
+    return {"ok": True, "deleted": res.deleted_count}
 
 
 app.include_router(api)
 
+_sync_task = None
+
+
+async def background_sync_loop():
+    """Sync periodico di tutte le caselle (Intesi/Gmail/Outlook/PEC)."""
+    import asyncio
+
+    interval = max(60, int(os.environ.get("SYNC_INTERVAL_SECONDS") or 120))
+    log.info("Background sync attivo ogni %ss", interval)
+    await asyncio.sleep(15)
+    while True:
+        try:
+            emails = await db.accounts.distinct("user_email")
+            for email_l in emails:
+                if not email_l:
+                    continue
+                try:
+                    result = await sync_accounts_for_user(email_l, notify=True)
+                    if result.get("messages_inserted"):
+                        log.info(
+                            "Background sync %s: +%s messaggi",
+                            email_l,
+                            result["messages_inserted"],
+                        )
+                except Exception:
+                    log.exception("Background sync fallito per %s", email_l)
+        except Exception:
+            log.exception("Background sync loop error")
+        await asyncio.sleep(interval)
+
+
+async def ensure_vapid_keys():
+    info = push_notify.init_vapid_from_env()
+    if info.get("source") == "env":
+        log.info("VAPID keys da env")
+        return
+    doc = await db.settings.find_one({"_id": "vapid"})
+    if doc and doc.get("public_key") and doc.get("private_key"):
+        push_notify.set_vapid_keys(doc["public_key"], doc["private_key"])
+        log.info("VAPID keys da Mongo")
+        return
+    keys = push_notify.generate_vapid_keypair()
+    await db.settings.update_one(
+        {"_id": "vapid"},
+        {
+            "$set": {
+                "public_key": keys["public_key"],
+                "private_key": keys["private_key"],
+                "updated_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+    push_notify.set_vapid_keys(keys["public_key"], keys["private_key"])
+    log.info("VAPID keys generate e salvate in Mongo")
+
 
 @app.on_event("startup")
 async def startup():
+    global _sync_task
+    import asyncio
+
+    removed = await dedupe_users_by_email()
+    if removed:
+        log.info("Removed %s duplicate user document(s)", removed)
     await db.users.create_index("email", unique=True)
     await db.accounts.create_index([("user_email", 1), ("address", 1)])
     await db.messages.create_index([("user_email", 1), ("date", -1)])
     await db.messages.create_index([("user_email", 1), ("is_pec", 1)])
+    await db.messages.create_index(
+        [("user_email", 1), ("account_id", 1), ("imap_uid", 1), ("folder", 1)],
+        unique=False,
+    )
     await db.outbox.create_index([("user_email", 1), ("status", 1)])
     await db.oauth_pending.create_index("state", unique=True)
     await db.oauth_pending.create_index("expires_at", expireAfterSeconds=0)
+    await db.push_subscriptions.create_index(
+        [("user_email", 1), ("endpoint", 1)], unique=True
+    )
+    await ensure_vapid_keys()
+    _sync_task = asyncio.create_task(background_sync_loop())
     log.info("Mail Manager API v2 ready — db=%s", db_name)

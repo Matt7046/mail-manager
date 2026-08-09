@@ -30,7 +30,7 @@ const PRESETS: Record<
     imap_port: 993,
     smtp_host: 'smtp-mail.outlook.com',
     smtp_port: 587,
-    hint: 'Outlook: NON serve l’inoltro. Serve solo «Consenti a dispositivi e app di usare IMAP» (Impostazioni → Posta → Inoltro e IMAP). Indirizzo = la casella Microsoft (es. ...@outlook.it). Se con App Password vedi AUTHENTICATE failed, Microsoft ha bloccato la login con password: serve OAuth.',
+    hint: 'Outlook: abilita IMAP (Impostazioni → Posta → Inoltro e IMAP). Usa una App Password Microsoft se disponibile. Se AUTHENTICATE failed, Microsoft potrebbe aver bloccato l’accesso con password.',
   },
   aruba: {
     imap_host: 'imaps.pec.aruba.it',
@@ -93,11 +93,6 @@ export default function Accounts() {
   const [customHost, setCustomHost] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
-  const [oauthCfg, setOauthCfg] = useState<{ google: boolean; microsoft: boolean }>({
-    google: false,
-    microsoft: false,
-  });
-  const [oauthBusy, setOauthBusy] = useState<'google' | 'microsoft' | null>(null);
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
@@ -107,46 +102,8 @@ export default function Accounts() {
   useFocusEffect(
     useCallback(() => {
       load().catch((e) => setStatus({ ok: false, text: e.message }));
-      api
-        .oauthStatus()
-        .then((s) =>
-          setOauthCfg({ google: s.google.configured, microsoft: s.microsoft.configured }),
-        )
-        .catch(() => setOauthCfg({ google: false, microsoft: false }));
     }, [load]),
   );
-
-  const startOAuth = async (provider: 'google' | 'microsoft') => {
-    if (!userEmail || !masterPassword) return;
-    if (!oauthCfg[provider]) {
-      setStatus({
-        ok: false,
-        text: `${provider === 'google' ? 'Google' : 'Microsoft'} OAuth non configurato sul server (CLIENT_ID/SECRET).`,
-      });
-      return;
-    }
-    setOauthBusy(provider);
-    try {
-      const res = await api.oauthStart(provider, userEmail, masterPassword);
-      const pending = JSON.stringify({
-        email: userEmail,
-        master_password: masterPassword,
-        provider,
-      });
-      try {
-        sessionStorage.setItem('mm_oauth_pending', pending);
-        localStorage.setItem('mm_oauth_pending', pending);
-      } catch {
-        /* ignore */
-      }
-      if (typeof window !== 'undefined') {
-        window.location.href = res.authorize_url;
-      }
-    } catch (e: any) {
-      setStatus({ ok: false, text: e.message });
-      setOauthBusy(null);
-    }
-  };
 
   const isPec =
     provider === 'aruba' ||
@@ -279,7 +236,7 @@ export default function Accounts() {
       } else {
         setStatus({
           ok: true,
-          text: `IMAP OK (${data.inbox_count ?? '?'} in INBOX). Sync: +${sync?.inserted ?? 0} nuovi. Torna in Inbox.`,
+          text: `IMAP OK (${data.inbox_count ?? '?'} in INBOX). Sync: +${sync?.messages_inserted ?? 0} nuovi. Torna in Inbox.`,
         });
       }
       await load();
@@ -344,32 +301,7 @@ export default function Accounts() {
         </TouchableOpacity>
       ))}
 
-      <Text style={styles.section}>Collega con OAuth</Text>
-      <Text style={styles.hint}>
-        Consigliato per Gmail e Outlook: apre il login Google/Microsoft (niente App Password).
-      </Text>
-      <View style={styles.oauthRow}>
-        <TouchableOpacity
-          style={[styles.oauthBtn, styles.oauthGoogle, !oauthCfg.google && styles.oauthDisabled]}
-          onPress={() => startOAuth('google')}
-          disabled={!!oauthBusy}
-        >
-          <Text style={styles.oauthBtnText}>
-            {oauthBusy === 'google' ? '…' : oauthCfg.google ? 'Google' : 'Google (non cfg)'}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.oauthBtn, styles.oauthMs, !oauthCfg.microsoft && styles.oauthDisabled]}
-          onPress={() => startOAuth('microsoft')}
-          disabled={!!oauthBusy}
-        >
-          <Text style={styles.oauthBtnText}>
-            {oauthBusy === 'microsoft' ? '…' : oauthCfg.microsoft ? 'Microsoft' : 'Microsoft (non cfg)'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      <Text style={styles.section}>{editingId ? 'Modifica casella' : 'Aggiungi casella (password)'}</Text>
+      <Text style={styles.section}>{editingId ? 'Modifica casella' : 'Aggiungi casella (IMAP / PEC)'}</Text>
       {editingId ? (
         <TouchableOpacity onPress={resetForm}>
           <Text style={[styles.link, { marginBottom: 10 }]}>Annulla modifica / nuova casella</Text>
@@ -503,15 +435,4 @@ const styles = StyleSheet.create({
   },
   btnText: { color: '#0b1220', fontWeight: '700' },
   hint: { color: '#f0c674', marginBottom: 12, fontSize: 13, lineHeight: 18 },
-  oauthRow: { flexDirection: 'row', gap: 10, marginBottom: 8 },
-  oauthBtn: {
-    flex: 1,
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  oauthGoogle: { backgroundColor: '#ea4335' },
-  oauthMs: { backgroundColor: '#0078d4' },
-  oauthDisabled: { opacity: 0.45 },
-  oauthBtnText: { color: '#fff', fontWeight: '700' },
 });

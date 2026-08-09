@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { createElement, useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -8,63 +8,143 @@ import {
   TextInput,
   RefreshControl,
   Alert,
+  Platform,
 } from 'react-native';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
-import { api, MessageListItem } from '@/src/services/api';
+import { api, Account, MessageListItem } from '@/src/services/api';
 
-type Filter = 'all' | 'unread' | 'pec';
+type Filter = 'all' | 'unread' | 'pec' | 'trash';
+
+const AUTO_SYNC_MS = 90_000;
+
+const FILTER_LABELS: Record<Filter, string> = {
+  all: 'Tutte',
+  unread: 'Non lette',
+  pec: 'PEC',
+  trash: 'Cestino',
+};
+
+function feedback(title: string, message: string) {
+  if (Platform.OS === 'web' && typeof window !== 'undefined') {
+    window.alert(`${title}\n\n${message}`);
+  } else {
+    Alert.alert(title, message);
+  }
+}
 
 export default function Home() {
-  const { userEmail, masterPassword, logout } = useAuth();
+  const { userEmail, masterPassword, logout, enableNotifications } = useAuth();
   const router = useRouter();
   const [items, setItems] = useState<MessageListItem[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [accountId, setAccountId] = useState('');
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [refreshing, setRefreshing] = useState(false);
+  const [syncHint, setSyncHint] = useState<string | null>(null);
+  const [pushHint, setPushHint] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const lastCount = useRef(0);
+
+  const loadAccounts = useCallback(async () => {
+    if (!userEmail || !masterPassword) return;
+    const list = await api.listAccounts(userEmail, masterPassword);
+    setAccounts(list);
+    setAccountId((prev) => (prev && !list.some((a) => a.id === prev) ? '' : prev));
+  }, [userEmail, masterPassword]);
 
   const load = useCallback(async () => {
     if (!userEmail || !masterPassword) return;
     const data = await api.listMessages({
       email: userEmail,
       master_password: masterPassword,
+      account: accountId || undefined,
       q: q.trim() || undefined,
       unread: filter === 'unread' ? true : undefined,
       pec: filter === 'pec' ? true : undefined,
+      folder: filter === 'trash' ? 'trash' : undefined,
     });
     setItems(data.items);
-  }, [userEmail, masterPassword, q, filter]);
+    lastCount.current = data.total ?? data.items.length;
+  }, [userEmail, masterPassword, q, filter, accountId]);
+
+  const runSync = useCallback(
+    async (silent = false) => {
+      if (!userEmail || !masterPassword) return;
+      try {
+        const res: any = await api.syncRun(userEmail, masterPassword);
+        const n = res?.messages_inserted ?? 0;
+        if (n > 0) {
+          setSyncHint(`${n} nuov${n === 1 ? 'a' : 'e'} email sincronizzat${n === 1 ? 'a' : 'e'}`);
+          if (
+            !silent &&
+            Platform.OS === 'web' &&
+            typeof Notification !== 'undefined' &&
+            Notification.permission === 'granted'
+          ) {
+            try {
+              new Notification(n === 1 ? 'Nuova email' : `${n} nuove email`, {
+                body: 'Inbox aggiornata',
+                icon: '/pwa/icon-192.png',
+                tag: 'new-mail-local',
+              });
+            } catch (_) {}
+          }
+        } else if (!silent) {
+          setSyncHint('Inbox aggiornata');
+        }
+        if (res?.errors?.length && !silent) {
+          Alert.alert('Sync parziale', res.errors.join('\n'));
+        }
+        await load();
+      } catch (e: any) {
+        if (!silent) Alert.alert('Sync', e.message);
+        setSyncHint(e.message);
+      }
+    },
+    [userEmail, masterPassword, load],
+  );
 
   useFocusEffect(
     useCallback(() => {
+      loadAccounts().catch(() => undefined);
       load().catch((e) => Alert.alert('Errore', e.message));
-    }, [load]),
+      runSync(true).catch(() => undefined);
+    }, [load, loadAccounts, runSync]),
   );
+
+  useEffect(() => {
+    if (!userEmail || !masterPassword) return;
+    const id = setInterval(() => {
+      runSync(true).catch(() => undefined);
+    }, AUTO_SYNC_MS);
+    return () => clearInterval(id);
+  }, [userEmail, masterPassword, runSync]);
 
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      if (userEmail && masterPassword) {
-        const res: any = await api.syncRun(userEmail, masterPassword);
-        if (res?.errors?.length) {
-          Alert.alert('Sync parziale', res.errors.join('\n'));
-        }
-      }
-      await load();
-    } catch (e: any) {
-      Alert.alert('Sync', e.message);
+      await runSync(false);
     } finally {
       setRefreshing(false);
     }
   };
 
-  const seed = async () => {
-    if (!userEmail || !masterPassword) return;
+  const onEnableNotifications = async () => {
+    if (pushBusy) return;
+    setPushBusy(true);
+    setPushHint(null);
     try {
-      await api.seedDemo(userEmail, masterPassword);
-      await load();
+      const res = await enableNotifications();
+      setPushHint({ ok: res.ok, text: res.message });
+      feedback(res.ok ? 'Notifiche' : 'Notifiche', res.message);
     } catch (e: any) {
-      Alert.alert('Demo', e.message);
+      const text = e?.message || 'Attivazione fallita';
+      setPushHint({ ok: false, text });
+      feedback('Notifiche', text);
+    } finally {
+      setPushBusy(false);
     }
   };
 
@@ -79,43 +159,94 @@ export default function Home() {
           <TouchableOpacity onPress={() => router.push('/accounts')}>
             <Text style={styles.link}>Account</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            onPress={async () => {
-              await logout();
-              router.replace('/login');
-            }}
-          >
-            <Text style={[styles.link, { color: '#ff6b6b' }]}>Esci</Text>
+          {Platform.OS === 'web' ? (
+            <TouchableOpacity onPress={onEnableNotifications} disabled={pushBusy}>
+              <Text style={styles.link}>{pushBusy ? '…' : 'Notifiche'}</Text>
+            </TouchableOpacity>
+          ) : null}
+          <TouchableOpacity onPress={() => logout()}>
+            <Text style={styles.linkMuted}>Esci</Text>
           </TouchableOpacity>
         </View>
       </View>
 
+      {syncHint ? <Text style={styles.hint}>{syncHint}</Text> : null}
+      {pushHint ? (
+        <Text style={pushHint.ok ? styles.pushOk : styles.pushErr}>{pushHint.text}</Text>
+      ) : null}
+
       <TextInput
         style={styles.search}
-        placeholder="Cerca oggetto o mittente…"
+        placeholder="Cerca…"
         placeholderTextColor="#666"
         value={q}
         onChangeText={setQ}
-        onSubmitEditing={() => load()}
+        onSubmitEditing={() => load().catch(() => undefined)}
       />
 
-      <View style={styles.chips}>
-        {([
-          ['all', 'Tutti'],
-          ['unread', 'Non lette'],
-          ['pec', 'Solo PEC'],
-        ] as const).map(([k, label]) => (
+      <View style={styles.filters}>
+        {(['all', 'unread', 'pec', 'trash'] as Filter[]).map((f) => (
           <TouchableOpacity
-            key={k}
-            style={[styles.chip, filter === k && styles.chipOn]}
-            onPress={() => setFilter(k)}
+            key={f}
+            style={[styles.chip, filter === f && styles.chipOn]}
+            onPress={() => setFilter(f)}
           >
-            <Text style={[styles.chipText, filter === k && styles.chipTextOn]}>{label}</Text>
+            <Text style={[styles.chipText, filter === f && styles.chipTextOn]}>
+              {FILTER_LABELS[f]}
+            </Text>
           </TouchableOpacity>
         ))}
-        <TouchableOpacity style={styles.chip} onPress={seed}>
-          <Text style={styles.chipText}>+ Demo</Text>
-        </TouchableOpacity>
+      </View>
+
+      <View style={styles.accountFilterWrap}>
+        {Platform.OS === 'web'
+          ? createElement(
+              'select',
+              {
+                value: accountId,
+                onChange: (e: any) => setAccountId(e.target.value || ''),
+                style: {
+                  width: '100%',
+                  padding: 12,
+                  borderRadius: 12,
+                  backgroundColor: '#16213e',
+                  color: '#fff',
+                  border: '1px solid #2a3a5c',
+                  fontSize: 14,
+                },
+              },
+              createElement('option', { key: 'all', value: '' }, 'Tutti gli account'),
+              ...accounts.map((a) =>
+                createElement(
+                  'option',
+                  { key: a.id, value: a.id },
+                  a.label ? `${a.label} — ${a.address}` : a.address,
+                ),
+              ),
+            )
+          : (
+            <View style={styles.accountChips}>
+              <TouchableOpacity
+                style={[styles.chip, !accountId && styles.chipOn]}
+                onPress={() => setAccountId('')}
+              >
+                <Text style={[styles.chipText, !accountId && styles.chipTextOn]}>
+                  Tutti gli account
+                </Text>
+              </TouchableOpacity>
+              {accounts.map((a) => (
+                <TouchableOpacity
+                  key={a.id}
+                  style={[styles.chip, accountId === a.id && styles.chipOn]}
+                  onPress={() => setAccountId(a.id)}
+                >
+                  <Text style={[styles.chipText, accountId === a.id && styles.chipTextOn]}>
+                    {a.address}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
       </View>
 
       <FlatList
@@ -127,7 +258,9 @@ export default function Home() {
         contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
         ListEmptyComponent={
           <Text style={styles.empty}>
-            Nessuna email. Aggiungi Gmail (App Password) o PEC in Account, poi scorri in basso per sincronizzare.
+            {filter === 'trash'
+              ? 'Cestino vuoto.'
+              : 'Nessuna email. Aggiungi una casella in Account: la sync automatica parte ogni ~2 minuti (e all’apertura inbox). Scorri in basso per forzare.'}
           </Text>
         }
         renderItem={({ item }) => (
@@ -161,7 +294,7 @@ export default function Home() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0b1220' },
   header: {
-    paddingTop: 56,
+    paddingTop: 52,
     paddingHorizontal: 16,
     paddingBottom: 8,
     flexDirection: 'row',
@@ -169,46 +302,69 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   title: { color: '#fff', fontSize: 22, fontWeight: '700' },
-  headerActions: { flexDirection: 'row', gap: 14 },
+  headerActions: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+  },
   link: { color: '#4ecdc4', fontWeight: '600' },
+  linkMuted: { color: '#888' },
+  hint: { color: '#f0c674', paddingHorizontal: 16, marginBottom: 6, fontSize: 13 },
+  pushOk: { color: '#4ecdc4', paddingHorizontal: 16, marginBottom: 6, fontSize: 13 },
+  pushErr: { color: '#ff8a8a', paddingHorizontal: 16, marginBottom: 6, fontSize: 13 },
   search: {
     marginHorizontal: 16,
-    marginBottom: 10,
     backgroundColor: '#16213e',
     borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    padding: 12,
     color: '#fff',
+    marginBottom: 8,
   },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingHorizontal: 16, marginBottom: 8 },
+  filters: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginBottom: 8,
+    alignItems: 'center',
+    flexWrap: 'wrap',
+  },
+  accountFilterWrap: {
+    marginHorizontal: 16,
+    marginBottom: 8,
+  },
+  accountChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
   chip: {
     paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 20,
+    paddingVertical: 6,
+    borderRadius: 14,
     backgroundColor: '#16213e',
   },
   chipOn: { backgroundColor: '#4ecdc4' },
   chipText: { color: '#aaa', fontSize: 13 },
   chipTextOn: { color: '#0b1220', fontWeight: '700' },
+  empty: { color: '#666', textAlign: 'center', marginTop: 48, paddingHorizontal: 24 },
   card: {
     backgroundColor: '#16213e',
-    borderRadius: 14,
+    borderRadius: 12,
     padding: 14,
     marginBottom: 10,
-    borderWidth: 1,
-    borderColor: '#1e2a44',
   },
-  cardUnread: { borderColor: '#4ecdc4' },
+  cardUnread: { borderLeftWidth: 3, borderLeftColor: '#4ecdc4' },
   cardTop: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
-  from: { color: '#ccc', flex: 1, fontSize: 13 },
+  from: { color: '#fff', fontWeight: '600', flex: 1 },
   pecBadge: {
     backgroundColor: '#e040a0',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
     borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
   },
   pecText: { color: '#fff', fontSize: 11, fontWeight: '700' },
-  subject: { color: '#fff', fontSize: 16, fontWeight: '600', marginTop: 4 },
+  subject: { color: '#ddd', marginTop: 4 },
   snippet: { color: '#888', marginTop: 4, fontSize: 13 },
-  empty: { color: '#666', textAlign: 'center', marginTop: 48, paddingHorizontal: 24 },
 });

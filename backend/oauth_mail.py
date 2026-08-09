@@ -21,6 +21,9 @@ MS_AUTH = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 MS_TOKEN = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 MS_GRAPH_ME = "https://graph.microsoft.com/v1.0/me"
 
+DEFAULT_GOOGLE_REDIRECT = "https://mail.colorsdev.tech/oauth/google/callback"
+DEFAULT_MS_REDIRECT = "https://mail.colorsdev.tech/oauth/microsoft/callback"
+
 GOOGLE_SCOPES = " ".join(
     [
         "openid",
@@ -42,31 +45,60 @@ MS_SCOPES = " ".join(
 )
 
 
+def _env(name: str, default: Optional[str] = None) -> str:
+    """Read env var and strip whitespace / CR / quotes (common .env paste mistakes)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default or ""
+    v = raw.strip().strip("\r").strip('"').strip("'")
+    return v
+
+
+def _google_client_id() -> str:
+    return _env("GOOGLE_CLIENT_ID")
+
+
+def _google_client_secret() -> str:
+    return _env("GOOGLE_CLIENT_SECRET")
+
+
+def _google_redirect_uri() -> str:
+    return _env("GOOGLE_REDIRECT_URI", DEFAULT_GOOGLE_REDIRECT) or DEFAULT_GOOGLE_REDIRECT
+
+
+def _ms_client_id() -> str:
+    return _env("MICROSOFT_CLIENT_ID")
+
+
+def _ms_client_secret() -> str:
+    return _env("MICROSOFT_CLIENT_SECRET")
+
+
+def _ms_redirect_uri() -> str:
+    return _env("MICROSOFT_REDIRECT_URI", DEFAULT_MS_REDIRECT) or DEFAULT_MS_REDIRECT
+
+
 def provider_configured(provider: str) -> bool:
     p = provider.lower()
     if p == "google":
-        return bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))
+        return bool(_google_client_id() and _google_client_secret())
     if p == "microsoft":
-        return bool(
-            os.environ.get("MICROSOFT_CLIENT_ID") and os.environ.get("MICROSOFT_CLIENT_SECRET")
-        )
+        return bool(_ms_client_id() and _ms_client_secret())
     return False
 
 
 def oauth_status() -> Dict[str, Any]:
+    # client_id is public in the authorize URL — expose it so Console can be matched without SSH.
     return {
         "google": {
             "configured": provider_configured("google"),
-            "redirect_uri": os.environ.get(
-                "GOOGLE_REDIRECT_URI", "https://mail.colorsdev.tech/oauth/google/callback"
-            ),
+            "redirect_uri": _google_redirect_uri(),
+            "client_id": _google_client_id(),
         },
         "microsoft": {
             "configured": provider_configured("microsoft"),
-            "redirect_uri": os.environ.get(
-                "MICROSOFT_REDIRECT_URI",
-                "https://mail.colorsdev.tech/oauth/microsoft/callback",
-            ),
+            "redirect_uri": _ms_redirect_uri(),
+            "client_id": _ms_client_id(),
         },
     }
 
@@ -74,10 +106,8 @@ def oauth_status() -> Dict[str, Any]:
 def build_authorize_url(provider: str, state: str) -> str:
     p = provider.lower()
     if p == "google":
-        cid = os.environ["GOOGLE_CLIENT_ID"]
-        redir = os.environ.get(
-            "GOOGLE_REDIRECT_URI", "https://mail.colorsdev.tech/oauth/google/callback"
-        )
+        cid = _google_client_id()
+        redir = _google_redirect_uri()
         q = urlencode(
             {
                 "client_id": cid,
@@ -92,11 +122,8 @@ def build_authorize_url(provider: str, state: str) -> str:
         )
         return f"{GOOGLE_AUTH}?{q}"
     if p == "microsoft":
-        cid = os.environ["MICROSOFT_CLIENT_ID"]
-        redir = os.environ.get(
-            "MICROSOFT_REDIRECT_URI",
-            "https://mail.colorsdev.tech/oauth/microsoft/callback",
-        )
+        cid = _ms_client_id()
+        redir = _ms_redirect_uri()
         q = urlencode(
             {
                 "client_id": cid,
@@ -115,30 +142,25 @@ async def exchange_code(provider: str, code: str) -> Dict[str, Any]:
     p = provider.lower()
     async with httpx.AsyncClient(timeout=30) as client:
         if p == "google":
-            redir = os.environ.get(
-                "GOOGLE_REDIRECT_URI", "https://mail.colorsdev.tech/oauth/google/callback"
-            )
+            redir = _google_redirect_uri()
             r = await client.post(
                 GOOGLE_TOKEN,
                 data={
                     "code": code,
-                    "client_id": os.environ["GOOGLE_CLIENT_ID"],
-                    "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+                    "client_id": _google_client_id(),
+                    "client_secret": _google_client_secret(),
                     "redirect_uri": redir,
                     "grant_type": "authorization_code",
                 },
             )
         elif p == "microsoft":
-            redir = os.environ.get(
-                "MICROSOFT_REDIRECT_URI",
-                "https://mail.colorsdev.tech/oauth/microsoft/callback",
-            )
+            redir = _ms_redirect_uri()
             r = await client.post(
                 MS_TOKEN,
                 data={
                     "code": code,
-                    "client_id": os.environ["MICROSOFT_CLIENT_ID"],
-                    "client_secret": os.environ["MICROSOFT_CLIENT_SECRET"],
+                    "client_id": _ms_client_id(),
+                    "client_secret": _ms_client_secret(),
                     "redirect_uri": redir,
                     "grant_type": "authorization_code",
                     "scope": MS_SCOPES,
@@ -159,8 +181,8 @@ async def refresh_access_token(provider: str, refresh_token: str) -> Dict[str, A
             r = await client.post(
                 GOOGLE_TOKEN,
                 data={
-                    "client_id": os.environ["GOOGLE_CLIENT_ID"],
-                    "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+                    "client_id": _google_client_id(),
+                    "client_secret": _google_client_secret(),
                     "refresh_token": refresh_token,
                     "grant_type": "refresh_token",
                 },
@@ -169,8 +191,8 @@ async def refresh_access_token(provider: str, refresh_token: str) -> Dict[str, A
             r = await client.post(
                 MS_TOKEN,
                 data={
-                    "client_id": os.environ["MICROSOFT_CLIENT_ID"],
-                    "client_secret": os.environ["MICROSOFT_CLIENT_SECRET"],
+                    "client_id": _ms_client_id(),
+                    "client_secret": _ms_client_secret(),
                     "refresh_token": refresh_token,
                     "grant_type": "refresh_token",
                     "scope": MS_SCOPES,

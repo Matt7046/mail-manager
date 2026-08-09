@@ -27,6 +27,13 @@ const inject = `
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" href="/favicon.png" sizes="128x128" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(function () {});
+        });
+      }
+    </script>
 `;
 
 const hasManifest = html.includes('rel="manifest"');

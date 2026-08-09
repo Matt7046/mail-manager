@@ -46,8 +46,8 @@ export default function Setup() {
         resizeMode="contain"
         accessibilityLabel="Mail Manager"
       />
-      <Text style={styles.brand}>Crea vault</Text>
-      <Text style={styles.sub}>Master password locale al vault</Text>
+      <Text style={styles.brand}>Nuovo account</Text>
+      <Text style={styles.sub}>Crea un vault con email e master password</Text>
       <TextInput
         style={styles.input}
         placeholder="Email"
@@ -66,7 +66,10 @@ export default function Setup() {
         onChangeText={setPassword}
       />
       <TouchableOpacity style={styles.btn} onPress={onSubmit} disabled={loading}>
-        <Text style={styles.btnText}>{loading ? '…' : 'Crea e continua'}</Text>
+        <Text style={styles.btnText}>{loading ? 'Creazione...' : 'Crea account'}</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={styles.loginLink} onPress={() => router.replace('/login')}>
+        <Text style={styles.loginLinkText}>Hai già un account? Accedi</Text>
       </TouchableOpacity>
     </KeyboardAvoidingView>
   );
@@ -102,4 +105,6 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   btnText: { color: '#0b1220', fontWeight: '700', fontSize: 16 },
+  loginLink: { alignItems: 'center', marginTop: 24, padding: 12 },
+  loginLinkText: { color: '#4ecdc4', fontSize: 14, textDecorationLine: 'underline' },
 });
