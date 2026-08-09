@@ -133,7 +133,14 @@ export default function Home() {
   useFocusEffect(
     useCallback(() => {
       loadAccounts().catch(() => undefined);
-      runSync(true).catch(() => undefined);
+      let force = false;
+      try {
+        force = sessionStorage.getItem('mm_force_sync') === '1';
+        if (force) sessionStorage.removeItem('mm_force_sync');
+      } catch {
+        /* ignore */
+      }
+      runSync(!force).catch(() => undefined);
     }, [loadAccounts, runSync]),
   );
 

@@ -120,10 +120,25 @@ export default function Compose() {
       const input = document.createElement('input');
       input.type = 'file';
       input.multiple = true;
-      fileInputRef.current = input;
-      input.onchange = () => {
-        if (input.files?.length) addFiles(input.files).catch(() => undefined);
+      input.accept = '*/*';
+      // Alcuni browser ignorano click() se l'input non è nel DOM
+      input.style.cssText =
+        'position:fixed;left:-9999px;top:0;opacity:0;width:1px;height:1px;';
+      document.body.appendChild(input);
+      const cleanup = () => {
+        try {
+          input.remove();
+        } catch {
+          /* ignore */
+        }
       };
+      input.addEventListener('change', () => {
+        const files = input.files;
+        cleanup();
+        if (files?.length) addFiles(files).catch(() => undefined);
+      });
+      input.addEventListener('cancel', cleanup);
+      fileInputRef.current = input;
       input.click();
       return;
     }
@@ -138,9 +153,16 @@ export default function Compose() {
   };
 
   const send = async () => {
-    if (!userEmail || !masterPassword || !accountId) return;
+    if (!userEmail || !masterPassword) {
+      feedback('Invio', 'Sessione scaduta: effettua di nuovo il login.');
+      return;
+    }
+    if (!accountId) {
+      feedback('Invio', 'Seleziona un account mittente.');
+      return;
+    }
     if (!to.trim()) {
-      Alert.alert('Destinatario mancante');
+      feedback('Invio', 'Inserisci almeno un destinatario.');
       return;
     }
     setSending(true);
@@ -155,17 +177,20 @@ export default function Compose() {
         as_pec: asPec || selected?.type === 'pec',
         reply_to_message_id: params.replyTo || null,
         attachments: attachments.map((a) => ({
-          filename: a.filename,
-          content_type: a.content_type,
-          content_base64: a.content_base64,
+          filename: (a.filename || 'allegato').trim() || 'allegato',
+          content_type: a.content_type || 'application/octet-stream',
+          content_base64: a.content_base64 || '',
         })),
       });
-      feedback('Inviato', attachments.length
-        ? `Email inviata con ${attachments.length} allegat${attachments.length === 1 ? 'o' : 'i'}.`
-        : 'Email inviata via SMTP');
+      feedback(
+        'Inviato',
+        attachments.length
+          ? `Email inviata con ${attachments.length} allegat${attachments.length === 1 ? 'o' : 'i'}.`
+          : 'Email inviata via SMTP',
+      );
       router.replace('/home');
     } catch (e: any) {
-      Alert.alert('Errore', e.message);
+      feedback('Errore invio', e?.message || 'Invio fallito');
     } finally {
       setSending(false);
     }

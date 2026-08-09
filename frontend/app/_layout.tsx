@@ -3,7 +3,7 @@ import { useEffect } from 'react';
 import { Platform } from 'react-native';
 import { AuthProvider, useAuth } from '@/src/contexts/AuthContext';
 
-/** Focus da Service Worker: porta all'inbox senza full reload se già autenticati. */
+/** Focus da Service Worker: porta all'inbox e forza sync IMAP. */
 function NotificationClickBridge() {
   const router = useRouter();
   const { masterPassword, isReady } = useAuth();
@@ -15,6 +15,11 @@ function NotificationClickBridge() {
     const onMessage = (event: MessageEvent) => {
       if (!event.data || event.data.type !== 'NOTIFICATION_CLICK') return;
       if (!isReady) return;
+      try {
+        sessionStorage.setItem('mm_force_sync', '1');
+      } catch {
+        /* ignore */
+      }
       if (masterPassword) {
         router.replace('/home');
       } else {

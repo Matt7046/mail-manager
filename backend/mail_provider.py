@@ -670,6 +670,129 @@ def _parse_fetch_items(
     }
 
 
+def _iter_file_attachments(msg: email.message.Message) -> List[Dict[str, Any]]:
+    """Estrae allegati file (esclude inline CID senza disposition attachment)."""
+    out: List[Dict[str, Any]] = []
+    if not msg.is_multipart():
+        return out
+    for part in msg.walk():
+        disp = str(part.get("Content-Disposition") or "")
+        filename = _decode_header(part.get_filename()) or ""
+        cid = part.get("Content-ID") or part.get("Content-Id")
+        is_att = "attachment" in disp.lower() or bool(filename)
+        if not is_att:
+            continue
+        if cid and "attachment" not in disp.lower():
+            continue
+        try:
+            raw = part.get_payload(decode=True) or b""
+        except Exception:
+            raw = b""
+        if not isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw) if raw else b""
+        out.append(
+            {
+                "filename": filename or "allegato",
+                "content_type": part.get_content_type() or "application/octet-stream",
+                "data": bytes(raw),
+                "size": len(raw),
+            }
+        )
+    return out
+
+
+def fetch_attachment(
+    host: str,
+    port: int,
+    user: str,
+    password: str = "",
+    *,
+    imap_uid: str,
+    folder: str = "INBOX",
+    index: int = 0,
+    account_type: str = "imap",
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Scarica un allegato dal provider IMAP (per UID + indice 0-based).
+    Supporta anche UID con prefisso gmraw: (Gmail All Mail).
+    """
+    hint = provider_hint or account_type
+    is_gmail = (account_type or "").lower() in ("google", "gmail") or (
+        hint or ""
+    ).lower() in ("google", "gmail")
+    uid_raw = (imap_uid or "").strip()
+    use_gmraw = uid_raw.startswith("gmraw:")
+    uid_s = uid_raw.split(":", 1)[1] if use_gmraw else uid_raw
+    if not uid_s.isdigit():
+        raise RuntimeError("UID messaggio non valido per download allegato")
+
+    client, _used = connect_mailbox(
+        host,
+        port,
+        user,
+        password,
+        provider_hint=hint,
+        access_token=access_token,
+    )
+    try:
+        folder_l = (folder or "INBOX").lower()
+        if use_gmraw or (is_gmail and folder_l == "sent"):
+            # Preferisci mailbox corretta
+            if use_gmraw:
+                box = _resolve_gmail_all_mail(client)
+                if not box:
+                    raise RuntimeError("Gmail All Mail non disponibile")
+            else:
+                box = resolve_sent_mailbox(client)
+                if not box:
+                    raise RuntimeError("Cartella Inviate non trovata")
+            typ, _ = client.select(_quote_mailbox(box), readonly=True)
+        elif folder_l == "sent":
+            box = resolve_sent_mailbox(client)
+            if not box:
+                raise RuntimeError("Cartella Inviate non trovata")
+            typ, _ = client.select(_quote_mailbox(box), readonly=True)
+        else:
+            typ, _ = client.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise RuntimeError("Impossibile aprire la mailbox per l'allegato")
+
+        typ, msg_data = client.uid("FETCH", uid_s, "(BODY.PEEK[])")
+        if typ != "OK" or not msg_data:
+            raise RuntimeError("Messaggio non trovato su IMAP")
+        raw = None
+        for item in msg_data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                body_part = item[1]
+                if isinstance(body_part, (bytes, bytearray)) and len(body_part) > 10:
+                    raw = body_part
+                    break
+        if not raw:
+            raise RuntimeError("Corpo messaggio vuoto su IMAP")
+        msg = email.message_from_bytes(raw)
+        atts = _iter_file_attachments(msg)
+        if not atts:
+            raise RuntimeError("Nessun allegato nel messaggio IMAP")
+        # Match per nome se l'indice non coincide (metadati sync vs parti reali)
+        chosen = None
+        if 0 <= index < len(atts):
+            chosen = atts[index]
+        if chosen is None:
+            raise RuntimeError(
+                f"Allegato #{index + 1} non trovato (disponibili: {len(atts)})"
+            )
+        if not chosen.get("data"):
+            raise RuntimeError(f"Allegato «{chosen.get('filename')}» vuoto")
+        return chosen
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
 def _fetch_from_selected(
     client: imaplib.IMAP4,
     *,
@@ -945,6 +1068,116 @@ def fetch_inbox(
         except Exception:
             pass
 
+
+def peek_new_inbox_headers(
+    host: str,
+    port: int,
+    user: str,
+    password: str = "",
+    *,
+    since_uid: Optional[str] = None,
+    limit: int = 15,
+    account_type: str = "imap",
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Poll leggero INBOX: solo header dei messaggi con UID > since_uid.
+    Usato per push rapide senza full sync BODY.
+    """
+    client, _used = connect_mailbox(
+        host,
+        port,
+        user,
+        password,
+        provider_hint=provider_hint or account_type,
+        access_token=access_token,
+    )
+    try:
+        typ, _ = client.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise RuntimeError("Impossibile aprire INBOX")
+        typ, data = client.uid("SEARCH", None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            return []
+        ids = data[0].split()
+        try:
+            floor = int(since_uid or "0")
+        except ValueError:
+            floor = 0
+        newer: List[bytes] = []
+        for uid_b in ids:
+            try:
+                if int(uid_b) > floor:
+                    newer.append(uid_b)
+            except ValueError:
+                continue
+        if not newer:
+            return []
+        newer = newer[-limit:]
+        messages: List[Dict[str, Any]] = []
+        for uid_b in newer:
+            uid_s = uid_b.decode() if isinstance(uid_b, bytes) else str(uid_b)
+            typ, msg_data = client.uid(
+                "FETCH",
+                uid_s,
+                "(FLAGS UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])",
+            )
+            if typ != "OK" or not msg_data:
+                continue
+            raw = None
+            flags_blob = b""
+            for item in msg_data:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    meta = item[0] if isinstance(item[0], (bytes, bytearray)) else b""
+                    flags_blob += meta + b" "
+                    body_part = item[1]
+                    if isinstance(body_part, (bytes, bytearray)) and len(body_part) > 2:
+                        raw = body_part
+                elif isinstance(item, (bytes, bytearray)):
+                    flags_blob += item + b" "
+            if not raw:
+                continue
+            msg = email.message_from_bytes(raw)
+            seen = False
+            flagged = False
+            m_flags = re.search(rb"FLAGS\s*\(([^)]*)\)", flags_blob, re.I)
+            if m_flags:
+                inner = m_flags.group(1).lower()
+                seen = b"\\seen" in inner
+                flagged = b"\\flagged" in inner
+            subject = _decode_header(msg.get("Subject")) or "(senza oggetto)"
+            from_addrs = _parse_addrs(msg.get("From"))
+            from_addr = from_addrs[0] if from_addrs else _decode_header(msg.get("From"))
+            messages.append(
+                {
+                    "imap_uid": uid_s,
+                    "message_id": (msg.get("Message-ID") or msg.get("Message-Id") or "").strip(),
+                    "subject": subject,
+                    "from_addr": from_addr or "",
+                    "to_addrs": _parse_addrs(msg.get("To")),
+                    "cc_addrs": [],
+                    "date": _msg_date(msg),
+                    "flags": {"seen": seen, "flagged": flagged, "archived": False},
+                    "has_attachments": False,
+                    "attachments": [],
+                    "inline_parts": [],
+                    "is_pec": _looks_like_pec(msg, account_type),
+                    "snippet": "",
+                    "body_text": "",
+                    "body_html": None,
+                    "folder": "INBOX",
+                    "header_only": True,
+                }
+            )
+        return messages
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
 def send_smtp(
     *,
     host: str,
@@ -1007,30 +1240,74 @@ def send_smtp(
 
     ctx = ssl.create_default_context()
     pwd = normalize_mailbox_secret(password)
+    is_gmail = "gmail" in (host or "").lower() or (user or "").endswith("@gmail.com")
+
+    def _xoauth2_login(smtp: smtplib.SMTP) -> None:
+        if not access_token:
+            raise RuntimeError("Token OAuth mancante per SMTP")
+        # Formato XOAUTH2 Gmail/Outlook (docmd + base64: più affidabile di smtp.auth)
+        auth_str = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+        token_b64 = b64mod.b64encode(auth_str.encode("utf-8")).decode("ascii")
+        code, resp = smtp.docmd("AUTH", f"XOAUTH2 {token_b64}")
+        if code != 235:
+            raise smtplib.SMTPAuthenticationError(
+                code, resp or b"XOAUTH2 SMTP fallito"
+            )
+
+    def _password_login(smtp: smtplib.SMTP) -> None:
+        if not pwd:
+            raise RuntimeError(
+                "Password SMTP vuota — usa App Password o ricollega OAuth"
+            )
+        smtp.login(user, pwd)
 
     def _login(smtp: smtplib.SMTP) -> None:
+        smtp.ehlo()
         if access_token:
-            auth_str = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
-
-            def _xoauth2(_challenge=None):
-                return auth_str
-
-            smtp.auth("XOAUTH2", _xoauth2, initial_response_ok=True)
+            _xoauth2_login(smtp)
         else:
-            smtp.login(user, pwd)
+            _password_login(smtp)
 
-    if use_ssl and not starttls:
-        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=60) as smtp:
-            _login(smtp)
-            smtp.sendmail(from_addr, recipients, payload)
-    else:
-        with smtplib.SMTP(host, port, timeout=60) as smtp:
-            smtp.ehlo()
-            if starttls or port == 587:
-                smtp.starttls(context=ctx)
+    def _send_via(*, ssl_mode: bool, port_n: int, do_starttls: bool) -> None:
+        if ssl_mode and not do_starttls:
+            with smtplib.SMTP_SSL(host, port_n, context=ctx, timeout=90) as smtp:
+                _login(smtp)
+                smtp.sendmail(from_addr, recipients, payload)
+        else:
+            with smtplib.SMTP(host, port_n, timeout=90) as smtp:
                 smtp.ehlo()
-            _login(smtp)
-            smtp.sendmail(from_addr, recipients, payload)
+                if do_starttls or port_n == 587:
+                    smtp.starttls(context=ctx)
+                    smtp.ehlo()
+                _login(smtp)
+                smtp.sendmail(from_addr, recipients, payload)
+
+    errors: List[str] = []
+    # Tentativi: config account, poi fallback Gmail 587 STARTTLS (OAuth spesso più stabile)
+    attempts = [
+        (bool(use_ssl and not starttls), int(port), bool(starttls or port == 587)),
+    ]
+    if access_token and is_gmail:
+        attempts.append((False, 587, True))
+        if int(port) != 465:
+            attempts.append((True, 465, False))
+
+    sent_ok = False
+    last_exc: Optional[Exception] = None
+    for ssl_mode, port_n, do_starttls in attempts:
+        try:
+            _send_via(ssl_mode=ssl_mode, port_n=port_n, do_starttls=do_starttls)
+            sent_ok = True
+            break
+        except Exception as exc:
+            last_exc = exc
+            errors.append(f"{host}:{port_n}: {exc}")
+            log.warning("SMTP tentativo fallito host=%s port=%s: %s", host, port_n, exc)
+
+    if not sent_ok:
+        raise RuntimeError(
+            " | ".join(errors) if errors else str(last_exc or "Invio SMTP fallito")
+        )
 
     return {
         "ok": True,

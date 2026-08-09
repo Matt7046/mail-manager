@@ -7,43 +7,49 @@ const BASE =
 
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-
   const res = await fetch(`${BASE}${path}`, {
-
     ...init,
-
     headers: {
-
       'Content-Type': 'application/json',
-
       ...(init?.headers || {}),
-
     },
-
   });
 
-  const data = await res.json().catch(() => ({}));
+  const rawText = await res.text();
+  let data: any = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    data = {};
+  }
 
   if (!res.ok) {
-
-    const detail = (data as any)?.detail;
-
+    if (res.status === 413) {
+      throw new Error(
+        'Allegato troppo grande per il server (limite upload). Riduci i file sotto ~18 MB totali.',
+      );
+    }
+    const detail = data?.detail;
     let msg: string;
-
     if (typeof detail === 'string') msg = detail;
-
-    else if (Array.isArray(detail))
-
-      msg = detail.map((d) => d?.msg || JSON.stringify(d)).join('; ');
-
-    else msg = (data as any)?.message || res.statusText || 'Errore';
-
+    else if (Array.isArray(detail)) {
+      msg = detail
+        .map((d: any) => {
+          const loc = Array.isArray(d?.loc)
+            ? d.loc.filter((x: any) => x !== 'body').join('.')
+            : '';
+          const m = d?.msg || JSON.stringify(d);
+          if (loc && /required/i.test(String(m))) {
+            return `Campo mancante: ${loc}`;
+          }
+          return loc ? `${loc}: ${m}` : m;
+        })
+        .join('; ');
+    } else msg = data?.message || rawText?.slice(0, 200) || res.statusText || 'Errore';
     throw new Error(msg);
-
   }
 
   return data as T;
-
 }
 
 
@@ -259,12 +265,17 @@ export const api = {
   },
 
   getMessage: (id: string, email: string, master_password: string) =>
-
     req<any>(
-
       `/api/messages/${id}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
-
     ),
+
+  attachmentDownloadUrl: (
+    id: string,
+    index: number,
+    email: string,
+    master_password: string,
+  ) =>
+    `${BASE}/api/messages/${id}/attachments/${index}?email=${encodeURIComponent(email)}&master_password=${encodeURIComponent(master_password)}`,
 
   trashMessage: (id: string, email: string, master_password: string) =>
 

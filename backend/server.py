@@ -212,19 +212,19 @@ class MessageAuthBody(BaseModel):
 
 
 class AttachmentIn(BaseModel):
-    filename: str
+    filename: str = "allegato"
     content_type: str = "application/octet-stream"
-    content_base64: str
+    content_base64: str = ""
 
 
 class SendBody(BaseModel):
     email: EmailStr
     master_password: str
     account_id: str
-    to: List[EmailStr]
-    cc: List[EmailStr] = []
-    bcc: List[EmailStr] = []
-    subject: str
+    to: List[str]
+    cc: List[str] = []
+    bcc: List[str] = []
+    subject: str = ""
     body_text: str = ""
     body_html: Optional[str] = None
     as_pec: bool = False
@@ -915,6 +915,18 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
                 data_url,
                 html_body,
             )
+    # Non esporre content_base64 nel dettaglio (download dedicato)
+    att_out = []
+    for a in m.get("attachments") or []:
+        if not isinstance(a, dict):
+            continue
+        att_out.append(
+            {
+                "filename": a.get("filename") or "allegato",
+                "content_type": a.get("content_type") or "application/octet-stream",
+                "size": a.get("size"),
+            }
+        )
     return {
         "id": str(m["_id"]),
         "account_id": m["account_id"],
@@ -924,8 +936,8 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
         "cc": m.get("cc_addrs", []),
         "date": m.get("date"),
         "flags": flags,
-        "has_attachments": m.get("has_attachments", False),
-        "attachments": m.get("attachments", []),
+        "has_attachments": m.get("has_attachments", False) or bool(att_out),
+        "attachments": att_out,
         "is_pec": m.get("is_pec", False),
         "body_text": body,
         "body_html": html_body or None,
@@ -933,6 +945,121 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
         "priority": m.get("priority"),
         "folder": m.get("folder") or "INBOX",
     }
+
+
+@api.get("/messages/{message_id}/attachments/{att_index}")
+async def download_attachment(
+    message_id: str,
+    att_index: int,
+    email: EmailStr,
+    master_password: str,
+):
+    """Scarica un allegato dal provider IMAP (on-demand)."""
+    import asyncio
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    from fastapi.responses import Response
+    from urllib.parse import quote
+
+    email_l = email.lower()
+    await require_user(email_l, master_password)
+    if att_index < 0:
+        raise HTTPException(400, "Indice allegato non valido")
+    try:
+        oid = ObjectId(message_id)
+    except InvalidId as exc:
+        raise HTTPException(400, "ID non valido") from exc
+    m = await db.messages.find_one({"_id": oid, "user_email": email_l})
+    if not m:
+        raise HTTPException(404, "Messaggio non trovato")
+
+    # Allegato salvato in chiaro (es. inviati dall'app) → download diretto
+    stored = m.get("attachments") or []
+    if (
+        0 <= att_index < len(stored)
+        and isinstance(stored[att_index], dict)
+        and stored[att_index].get("content_base64")
+    ):
+        import base64 as _b64
+
+        try:
+            raw = _b64.b64decode(stored[att_index]["content_base64"], validate=False)
+        except Exception as exc:
+            raise HTTPException(400, "Allegato corrotto in archivio") from exc
+        filename = stored[att_index].get("filename") or "allegato"
+        ctype = stored[att_index].get("content_type") or "application/octet-stream"
+        if not raw:
+            raise HTTPException(400, "Allegato vuoto in archivio")
+        safe_ascii = re.sub(r"[^\w.\-]+", "_", filename).strip("._") or "allegato"
+        disp = (
+            f'attachment; filename="{safe_ascii}"; '
+            f"filename*=UTF-8''{quote(filename)}"
+        )
+        return Response(
+            content=raw,
+            media_type=ctype.split(";")[0].strip() or "application/octet-stream",
+            headers={
+                "Content-Disposition": disp,
+                "Cache-Control": "private, max-age=60",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    imap_uid = (m.get("imap_uid") or "").strip()
+    if not imap_uid:
+        raise HTTPException(
+            404,
+            "Allegato non scaricabile: messaggio non ancora sincronizzato da IMAP",
+        )
+    try:
+        acc_oid = ObjectId(m["account_id"])
+    except Exception as exc:
+        raise HTTPException(400, "Account messaggio non valido") from exc
+    acc = await db.accounts.find_one({"_id": acc_oid, "user_email": email_l})
+    if not acc:
+        raise HTTPException(404, "Account non trovato")
+
+    try:
+        user, pwd, access_token = await resolve_mailbox_creds(acc, email_l)
+        att = await asyncio.to_thread(
+            mail_provider.fetch_attachment,
+            acc["imap_host"],
+            int(acc.get("imap_port") or 993),
+            user,
+            pwd or "",
+            imap_uid=imap_uid,
+            folder=m.get("folder") or "INBOX",
+            index=att_index,
+            account_type=acc.get("type") or "imap",
+            provider_hint=acc.get("pec_provider") or acc.get("type"),
+            access_token=access_token,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Download allegato fallito msg=%s idx=%s", message_id, att_index)
+        raise HTTPException(400, f"Download fallito: {exc}") from exc
+
+    filename = att.get("filename") or "allegato"
+    ctype = att.get("content_type") or "application/octet-stream"
+    raw = att.get("data") or b""
+    if not raw:
+        raise HTTPException(400, "Allegato vuoto sul server di posta")
+    # filename ASCII fallback + UTF-8 (Chrome/PWA)
+    safe_ascii = re.sub(r"[^\w.\-]+", "_", filename).strip("._") or "allegato"
+    disp = (
+        f'attachment; filename="{safe_ascii}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=raw,
+        media_type=ctype.split(";")[0].strip() or "application/octet-stream",
+        headers={
+            "Content-Disposition": disp,
+            "Cache-Control": "private, max-age=60",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @api.post("/messages/{message_id}/trash")
@@ -1062,9 +1189,26 @@ async def send_message(body: SendBody):
     starttls = bool(acc.get("smtp_starttls", smtp_port == 587))
 
     now = datetime.utcnow()
-    to_addrs = [str(x).lower() for x in body.to]
-    cc_addrs = [str(x).lower() for x in body.cc]
-    bcc_addrs = [str(x).lower() for x in body.bcc]
+
+    def _norm_addrs(vals: List[str]) -> List[str]:
+        out: List[str] = []
+        for raw in vals:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            # Accetta "Nome <mail@x.it>" → mail@x.it
+            m = re.search(r"<([^>]+)>", s)
+            addr = (m.group(1) if m else s).strip().lower()
+            if "@" not in addr:
+                raise HTTPException(400, f"Destinatario non valido: {raw}")
+            out.append(addr)
+        return out
+
+    to_addrs = _norm_addrs([str(x) for x in body.to])
+    cc_addrs = _norm_addrs([str(x) for x in body.cc])
+    bcc_addrs = _norm_addrs([str(x) for x in body.bcc])
+    if not to_addrs:
+        raise HTTPException(400, "Inserisci almeno un destinatario valido")
 
     # Limiti allegati (base64 in JSON)
     MAX_ATT = 10
@@ -1141,6 +1285,8 @@ async def send_message(body: SendBody):
             "filename": a["filename"],
             "content_type": a["content_type"],
             "size": a["size"],
+            # Consente download subito dopo invio (prima del sync IMAP)
+            "content_base64": a.get("content_base64") or "",
         }
         for a in att_payload
     ]
@@ -1610,32 +1756,172 @@ app.include_router(api)
 _sync_task = None
 
 
-async def background_sync_loop():
-    """Sync periodico di tutte le caselle (Intesi/Gmail/Outlook/PEC)."""
+async def peek_and_notify_for_user(email_l: str) -> Dict[str, Any]:
+    """
+    Poll rapido INBOX (solo header): push in pochi secondi.
+    Il body completo arriva dal sync periodico / click notifica / pull.
+    """
     import asyncio
 
-    interval = max(60, int(os.environ.get("SYNC_INTERVAL_SECONDS") or 120))
-    log.info("Background sync attivo ogni %ss", interval)
-    await asyncio.sleep(15)
+    notified = 0
+    errors: List[str] = []
+    previews: List[Dict[str, str]] = []
+
+    async for acc in db.accounts.find({"user_email": email_l}):
+        aid = str(acc["_id"])
+        try:
+            user, pwd, access_token = await resolve_mailbox_creds(acc, email_l)
+            since = acc.get("last_notify_uid")
+            # Prima volta: ancora il cursore all'ultimo UID senza spam di notifiche storiche
+            bootstrap = since is None or since == ""
+            peeked = await asyncio.to_thread(
+                mail_provider.peek_new_inbox_headers,
+                acc["imap_host"],
+                int(acc.get("imap_port") or 993),
+                user,
+                pwd or "",
+                since_uid=None if bootstrap else str(since),
+                limit=20 if bootstrap else 15,
+                account_type=acc.get("type") or "imap",
+                provider_hint=acc.get("pec_provider") or acc.get("type"),
+                access_token=access_token,
+            )
+            if not peeked:
+                continue
+            max_uid = max(int(m["imap_uid"]) for m in peeked)
+            if bootstrap:
+                await db.accounts.update_one(
+                    {"_id": acc["_id"]},
+                    {"$set": {"last_notify_uid": str(max_uid)}},
+                )
+                continue
+
+            for m in peeked:
+                lookup = {
+                    "user_email": email_l,
+                    "account_id": aid,
+                    "imap_uid": m["imap_uid"],
+                    "folder": "INBOX",
+                }
+                existing = await db.messages.find_one(
+                    {
+                        **{k: lookup[k] for k in ("user_email", "account_id", "imap_uid")},
+                        "$or": [
+                            {"folder": {"$in": ["INBOX", "trash"]}},
+                            {"folder": {"$exists": False}},
+                            {"folder": None},
+                        ],
+                    }
+                )
+                if existing:
+                    continue
+                payload = {
+                    **lookup,
+                    "message_id": m.get("message_id"),
+                    "subject": m.get("subject", ""),
+                    "from_addr": m.get("from_addr", ""),
+                    "to_addrs": m.get("to_addrs", []),
+                    "cc_addrs": [],
+                    "date": m.get("date") or datetime.utcnow(),
+                    "flags": m.get("flags") or {"seen": False},
+                    "has_attachments": False,
+                    "attachments": [],
+                    "inline_parts": [],
+                    "is_pec": m.get("is_pec", False),
+                    "snippet": m.get("snippet") or "",
+                    "body_enc": encrypt_secret("", email_l),
+                    "body_html": None,
+                    "receipts": [],
+                    "header_only": True,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                }
+                await db.messages.insert_one(payload)
+                notified += 1
+                if len(previews) < 5:
+                    previews.append(
+                        {
+                            "subject": (m.get("subject") or "(senza oggetto)")[:80],
+                            "from": (m.get("from_addr") or "")[:60],
+                            "is_pec": "1" if m.get("is_pec") else "0",
+                            "account": acc.get("label") or acc.get("address") or "",
+                        }
+                    )
+
+            await db.accounts.update_one(
+                {"_id": acc["_id"]},
+                {"$set": {"last_notify_uid": str(max_uid)}},
+            )
+        except HTTPException as exc:
+            errors.append(f"{acc.get('address')}: {exc.detail}")
+        except Exception as exc:
+            log.warning("Peek notify fallito %s: %s", acc.get("address"), exc)
+            errors.append(f"{acc.get('address')}: {exc}")
+
+    if notified > 0 and previews:
+        await notify_user_new_mail(email_l, notified, previews)
+
+    return {"notified": notified, "errors": errors}
+
+
+async def background_sync_loop():
+    """
+    Due ritmi:
+    - peek/notify ogni NOTIFY_POLL_SECONDS (default 5s) → push rapide
+    - full sync ogni SYNC_INTERVAL_SECONDS (default 120s) → body/allegati, senza ripush
+    """
+    import asyncio
+    import time
+
+    notify_every = max(5, int(os.environ.get("NOTIFY_POLL_SECONDS") or 5))
+    sync_every = max(60, int(os.environ.get("SYNC_INTERVAL_SECONDS") or 120))
+    log.info(
+        "Background: notify ogni %ss, full sync ogni %ss",
+        notify_every,
+        sync_every,
+    )
+    await asyncio.sleep(8)
+    last_full_sync = 0.0
     while True:
+        loop_started = time.monotonic()
         try:
             emails = await db.accounts.distinct("user_email")
             for email_l in emails:
                 if not email_l:
                     continue
                 try:
-                    result = await sync_accounts_for_user(email_l, notify=True)
-                    if result.get("messages_inserted"):
+                    result = await peek_and_notify_for_user(email_l)
+                    if result.get("notified"):
                         log.info(
-                            "Background sync %s: +%s messaggi",
+                            "Peek notify %s: +%s",
                             email_l,
-                            result["messages_inserted"],
+                            result["notified"],
                         )
                 except Exception:
-                    log.exception("Background sync fallito per %s", email_l)
+                    log.exception("Peek notify fallito per %s", email_l)
+
+            now = time.monotonic()
+            if now - last_full_sync >= sync_every:
+                for email_l in emails:
+                    if not email_l:
+                        continue
+                    try:
+                        # notify=False: le push le fa già il peek
+                        result = await sync_accounts_for_user(email_l, notify=False)
+                        if result.get("messages_inserted"):
+                            log.info(
+                                "Background sync %s: +%s messaggi",
+                                email_l,
+                                result["messages_inserted"],
+                            )
+                    except Exception:
+                        log.exception("Background sync fallito per %s", email_l)
+                last_full_sync = now
         except Exception:
-            log.exception("Background sync loop error")
-        await asyncio.sleep(interval)
+            log.exception("Background loop error")
+
+        elapsed = time.monotonic() - loop_started
+        await asyncio.sleep(max(1.0, notify_every - elapsed))
 
 
 async def ensure_vapid_keys():

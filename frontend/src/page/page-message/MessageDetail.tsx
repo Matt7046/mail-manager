@@ -25,6 +25,21 @@ function cleanPlainText(s: string): string {
     .trim();
 }
 
+function formatSize(n: number): string {
+  if (!n || n < 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function feedback(title: string, message: string) {
+  if (Platform.OS === 'web' && typeof window !== 'undefined') {
+    window.alert(`${title}\n\n${message}`);
+  } else {
+    Alert.alert(title, message);
+  }
+}
+
 function EmailHtmlBody({ html }: { html: string }) {
   const srcDoc = useMemo(() => {
     const safe = html || '';
@@ -63,6 +78,7 @@ export default function MessageDetail() {
   const [msg, setMsg] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [downloading, setDownloading] = useState<number | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -135,6 +151,61 @@ export default function MessageDetail() {
     );
   };
 
+  const downloadAttachment = async (index: number, meta: any) => {
+    if (!id || !userEmail || !masterPassword || downloading !== null) return;
+    setDownloading(index);
+    try {
+      const url = api.attachmentDownloadUrl(id, index, userEmail, masterPassword);
+      const filename = meta?.filename || `allegato-${index + 1}`;
+
+      if (Platform.OS !== 'web' || typeof document === 'undefined') {
+        feedback(
+          'Download',
+          'Apri Mail Manager dal browser / PWA per scaricare gli allegati.',
+        );
+        return;
+      }
+
+      const res = await fetch(url, { method: 'GET', credentials: 'same-origin' });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const j = await res.json();
+          detail = typeof j?.detail === 'string' ? j.detail : detail;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail || 'Download fallito');
+      }
+      const blob = await res.blob();
+      if (!blob || blob.size === 0) {
+        throw new Error('File scaricato vuoto — riprova dopo un sync della casella');
+      }
+
+      // Non revocare subito l'object URL: Chrome annulla il download
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = filename;
+      a.rel = 'noopener';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {
+          /* ignore */
+        }
+      }, 60_000);
+    } catch (e: any) {
+      feedback('Download', e?.message || 'Impossibile scaricare l’allegato');
+    } finally {
+      setDownloading(null);
+    }
+  };
+
   if (loading || !msg) {
     return (
       <View style={styles.center}>
@@ -196,6 +267,38 @@ export default function MessageDetail() {
         <Text style={styles.meta}>A: {(msg.to || []).join(', ')}</Text>
         <Text style={styles.meta}>{msg.date ? new Date(msg.date).toLocaleString() : ''}</Text>
 
+        {(msg.attachments || []).length > 0 ? (
+          <View style={styles.attachments}>
+            <Text style={styles.attachTitle}>
+              Allegati ({msg.attachments.length})
+            </Text>
+            {msg.attachments.map((a: any, i: number) => (
+              <TouchableOpacity
+                key={`${a.filename || 'file'}-${i}`}
+                style={styles.attachRow}
+                disabled={busy}
+                onPress={() => downloadAttachment(i, a)}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.attachName} numberOfLines={1}>
+                    {a.filename || `Allegato ${i + 1}`}
+                  </Text>
+                  <Text style={styles.attachMeta}>
+                    {a.content_type || 'file'}
+                    {a.size ? ` · ${formatSize(a.size)}` : ''}
+                    {downloading === i ? ' · download…' : ''}
+                  </Text>
+                </View>
+                <Text style={styles.attachDl}>Scarica</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        ) : msg.has_attachments ? (
+          <Text style={styles.attachHint}>
+            Questo messaggio ha allegati: aprilo di nuovo dopo un sync se non compaiono.
+          </Text>
+        ) : null}
+
         {msg.is_pec && msg.receipts?.length ? (
           <View style={styles.receipts}>
             <Text style={styles.receiptTitle}>Ricevute PEC</Text>
@@ -248,6 +351,27 @@ const styles = StyleSheet.create({
   trashText: { color: '#fff', fontSize: 11, fontWeight: '700' },
   subject: { color: '#fff', fontSize: 20, fontWeight: '700', flex: 1 },
   meta: { color: '#999', marginBottom: 4 },
+  attachments: {
+    backgroundColor: '#16213e',
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 12,
+    marginBottom: 8,
+    gap: 8,
+  },
+  attachTitle: { color: '#4ecdc4', fontWeight: '700', marginBottom: 4 },
+  attachRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#243044',
+  },
+  attachName: { color: '#fff', fontWeight: '600' },
+  attachMeta: { color: '#888', fontSize: 12, marginTop: 2 },
+  attachDl: { color: '#4ecdc4', fontWeight: '700' },
+  attachHint: { color: '#888', fontSize: 13, marginTop: 10, marginBottom: 4 },
   receipts: {
     backgroundColor: '#16213e',
     borderRadius: 10,
