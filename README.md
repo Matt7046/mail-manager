@@ -60,7 +60,7 @@ npx expo start --web
 
 ## Deploy → https://mail.colorsdev.tech
 
-DNS **GoDaddy** → VPS → nginx Activity Manager (`/root/nginx-apps/mail.colorsdev.tech.conf`) + API Docker sulla rete `backend_app-network`. Niente Cloudflare Tunnel.
+DNS **GoDaddy** → VPS → nginx **colorsdev-site** (`/root/nginx-apps/mail.colorsdev.tech.conf`) + API Docker sulla rete `backend_app-network`. Niente Cloudflare Tunnel.
 
 ```bat
 cd backend\bat\deploy
@@ -75,6 +75,7 @@ DEPLOY-ALL.BAT            rem API Hub + web static
 | `DEPLOY-WEB.BAT` | Export Expo → `/root/mail-manager/web` + reload nginx |
 | `DEPLOY-ALL.BAT` | API + WEB |
 
+Web root: `/root/mail-manager/web` (edge: `/var/www/root/mail-manager/web`).  
 Guida: [`backend/bat/deploy/README.md`](backend/bat/deploy/README.md).
 
 ## Sicurezza
