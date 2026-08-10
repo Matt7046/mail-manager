@@ -9,6 +9,8 @@ import {
   RefreshControl,
   Alert,
   Platform,
+  Image,
+  Linking,
 } from 'react-native';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useAuth } from '@/src/contexts/AuthContext';
@@ -19,6 +21,9 @@ type FolderTab = 'inbox' | 'sent' | 'trash';
 const AUTO_SYNC_MS = 90_000;
 const PULL_THRESHOLD = 72;
 const PULL_MAX = 120;
+const PERSONALITY_URL = 'https://colorsdev.tech/personality';
+
+const COLORSDEV_URL = 'https://colorsdev.tech/';
 
 const FOLDER_LABELS: Record<FolderTab, string> = {
   inbox: 'Ricevute',
@@ -371,6 +376,18 @@ export default function Home() {
 
   return (
     <View style={styles.container}>
+      <TouchableOpacity
+        style={styles.brandHeader}
+        onPress={() => Linking.openURL(COLORSDEV_URL)}
+        accessibilityRole="link"
+        accessibilityLabel="colorsdev.tech"
+      >
+        <Image
+          source={{ uri: '/logo-colorsdev-v2.png' }}
+          style={styles.brandLogo}
+          resizeMode="contain"
+        />
+      </TouchableOpacity>
       <View style={styles.header}>
         <Text style={styles.title}>Mail Manager</Text>
         <View style={styles.headerActionsCol}>
@@ -400,6 +417,9 @@ export default function Home() {
             </TouchableOpacity>
             <TouchableOpacity onPress={() => router.push('/accounts')}>
               <Text style={styles.link}>Account</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => Linking.openURL(PERSONALITY_URL)}>
+              <Text style={styles.link}>Personalità</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -625,8 +645,18 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   pullText: { color: '#7a8aaa', fontSize: 12, fontWeight: '600' },
+  brandHeader: {
+    alignItems: 'center',
+    paddingTop: 28,
+    paddingBottom: 4,
+  },
+  brandLogo: {
+    width: '100%',
+    maxWidth: 220,
+    height: 52,
+  },
   header: {
-    paddingTop: 52,
+    paddingTop: 12,
     paddingHorizontal: 16,
     paddingBottom: 8,
     flexDirection: 'row',

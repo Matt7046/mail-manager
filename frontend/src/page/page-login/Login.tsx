@@ -9,12 +9,17 @@ import {
   Platform,
   Image,
   View,
+  Linking,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { useAuth } from '@/src/contexts/AuthContext';
 import { oauthCallbackPathFromQuery } from '@/src/lib/oauthStrayRedirect';
+
+const PERSONALITY_URL = 'https://colorsdev.tech/personality';
+
+const COLORSDEV_URL = 'https://colorsdev.tech/';
 
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -126,6 +131,23 @@ export default function Login() {
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
+      <TouchableOpacity
+        style={styles.brandHeader}
+        onPress={() => Linking.openURL(COLORSDEV_URL)}
+        accessibilityRole="link"
+        accessibilityLabel="colorsdev.tech"
+      >
+        <Image
+          source={{ uri: '/logo-colorsdev-v2.png' }}
+          style={styles.brandLogo}
+          resizeMode="contain"
+        />
+        <Text style={styles.brandName}>
+          <Text style={styles.brandPrefix}>colorsdev</Text>
+          <Text style={styles.brandSuffix}>.tech</Text>
+        </Text>
+      </TouchableOpacity>
+
       <Image
         source={{ uri: '/logo-mail-manager.png' }}
         style={styles.logo}
@@ -176,6 +198,14 @@ export default function Login() {
       <TouchableOpacity style={styles.createBtn} onPress={() => router.push('/setup')}>
         <Text style={styles.createText}>Crea account</Text>
       </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.personalityLink}
+        onPress={() => Linking.openURL(PERSONALITY_URL)}
+        accessibilityRole="link"
+      >
+        <Text style={styles.personalityText}>Scopri l'analisi IA della personalità</Text>
+      </TouchableOpacity>
     </KeyboardAvoidingView>
   );
 }
@@ -187,9 +217,25 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
+  brandHeader: {
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  brandLogo: {
+    width: '100%',
+    maxWidth: 280,
+    height: 70,
+  },
+  brandName: {
+    marginTop: 6,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  brandPrefix: { color: '#e8eff7' },
+  brandSuffix: { color: '#60a5fa' },
   logo: {
     width: '100%',
-    height: 120,
+    height: 88,
     marginBottom: 8,
     alignSelf: 'center',
   },
@@ -244,4 +290,14 @@ const styles = StyleSheet.create({
     borderColor: '#4ecdc4',
   },
   createText: { color: '#4ecdc4', fontSize: 16, fontWeight: '600' },
+  personalityLink: {
+    marginTop: 20,
+    alignItems: 'center',
+    padding: 8,
+  },
+  personalityText: {
+    color: '#60a5fa',
+    fontSize: 14,
+    textDecorationLine: 'underline',
+  },
 });
