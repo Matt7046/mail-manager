@@ -19,8 +19,6 @@ import { oauthCallbackPathFromQuery } from '@/src/lib/oauthStrayRedirect';
 
 const PERSONALITY_URL = 'https://colorsdev.tech/personality';
 
-const COLORSDEV_URL = 'https://colorsdev.tech/';
-
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -131,23 +129,6 @@ export default function Login() {
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
-      <TouchableOpacity
-        style={styles.brandHeader}
-        onPress={() => Linking.openURL(COLORSDEV_URL)}
-        accessibilityRole="link"
-        accessibilityLabel="colorsdev.tech"
-      >
-        <Image
-          source={{ uri: '/logo-colorsdev-v2.png' }}
-          style={styles.brandLogo}
-          resizeMode="contain"
-        />
-        <Text style={styles.brandName}>
-          <Text style={styles.brandPrefix}>colorsdev</Text>
-          <Text style={styles.brandSuffix}>.tech</Text>
-        </Text>
-      </TouchableOpacity>
-
       <Image
         source={{ uri: '/logo-mail-manager.png' }}
         style={styles.logo}
@@ -217,25 +198,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
-  brandHeader: {
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  brandLogo: {
-    width: '100%',
-    maxWidth: 280,
-    height: 70,
-  },
-  brandName: {
-    marginTop: 6,
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  brandPrefix: { color: '#e8eff7' },
-  brandSuffix: { color: '#60a5fa' },
   logo: {
     width: '100%',
-    height: 88,
+    height: 120,
     marginBottom: 8,
     alignSelf: 'center',
   },

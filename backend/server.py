@@ -867,15 +867,17 @@ async def list_messages(
 
 @api.get("/messages/{message_id}")
 async def get_message(message_id: str, email: EmailStr, master_password: str):
+    import asyncio
     from bson import ObjectId
     from bson.errors import InvalidId
 
-    await require_user(email.lower(), master_password)
+    email_l = email.lower()
+    await require_user(email_l, master_password)
     try:
         oid = ObjectId(message_id)
     except InvalidId as exc:
         raise HTTPException(400, "ID non valido") from exc
-    m = await db.messages.find_one({"_id": oid, "user_email": email.lower()})
+    m = await db.messages.find_one({"_id": oid, "user_email": email_l})
     if not m:
         raise HTTPException(404, "Messaggio non trovato")
     # Apertura messaggio → segna come letta
@@ -889,12 +891,79 @@ async def get_message(message_id: str, email: EmailStr, master_password: str):
     body = m.get("body_text", "")
     if m.get("body_enc"):
         try:
-            body = decrypt_secret(m["body_enc"], email.lower())
+            body = decrypt_secret(m["body_enc"], email_l)
         except Exception:
             body = m.get("body_text", "")
     # Pulisci &zwnj; / zero-width anche su messaggi già syncati
     body = mail_provider._clean_text(body or "")
     html_body = m.get("body_html") or ""
+
+    # Stub peek/notify (header_only=True, corpo vuoto) → FETCH on-demand da IMAP.
+    # La mail più recente in lista è spesso uno stub: push veloce senza BODY fino al full sync.
+    if m.get("header_only") is True and (m.get("imap_uid") or "").strip():
+        body_missing = not (body or "").strip() and not (html_body or "").strip()
+        if not body_missing:
+            # Full sync ha già scritto il corpo ma non aveva azzerato il flag
+            await db.messages.update_one(
+                {"_id": oid},
+                {"$set": {"header_only": False, "updated_at": datetime.utcnow()}},
+            )
+            m["header_only"] = False
+        else:
+            try:
+                acc_oid = ObjectId(m["account_id"])
+                acc = await db.accounts.find_one({"_id": acc_oid, "user_email": email_l})
+                if acc and acc.get("imap_host"):
+                    user, pwd, access_token = await resolve_mailbox_creds(acc, email_l)
+                    fetched = await asyncio.to_thread(
+                        mail_provider.fetch_message_by_uid,
+                        acc["imap_host"],
+                        int(acc.get("imap_port") or 993),
+                        user,
+                        pwd or "",
+                        imap_uid=str(m["imap_uid"]),
+                        folder=m.get("folder") or "INBOX",
+                        account_type=acc.get("type") or "imap",
+                        provider_hint=acc.get("pec_provider") or acc.get("type"),
+                        access_token=access_token,
+                    )
+                    text_f = mail_provider._clean_text(fetched.get("body_text") or "")
+                    html_f = fetched.get("body_html") or ""
+                    snippet_f = fetched.get("snippet") or (text_f[:180] if text_f else "")
+                    imap_flags = dict(fetched.get("flags") or {})
+                    # Non azzerare "letto in app"
+                    imap_flags["seen"] = True
+                    hydrate = {
+                        "subject": fetched.get("subject") or m.get("subject", ""),
+                        "from_addr": fetched.get("from_addr") or m.get("from_addr", ""),
+                        "to_addrs": fetched.get("to_addrs") or m.get("to_addrs", []),
+                        "cc_addrs": fetched.get("cc_addrs") or m.get("cc_addrs", []),
+                        "date": fetched.get("date") or m.get("date"),
+                        "flags": imap_flags,
+                        "has_attachments": fetched.get("has_attachments", False),
+                        "attachments": fetched.get("attachments") or [],
+                        "inline_parts": fetched.get("inline_parts") or [],
+                        "is_pec": fetched.get("is_pec", m.get("is_pec", False)),
+                        "snippet": snippet_f,
+                        "body_enc": encrypt_secret(text_f, email_l),
+                        "body_html": html_f or None,
+                        "header_only": False,
+                        "updated_at": datetime.utcnow(),
+                    }
+                    if fetched.get("message_id"):
+                        hydrate["message_id"] = fetched["message_id"]
+                    await db.messages.update_one({"_id": oid}, {"$set": hydrate})
+                    m = {**m, **hydrate}
+                    body = text_f
+                    html_body = html_f or ""
+                    flags = imap_flags
+            except Exception:
+                log.exception(
+                    "Idratazione corpo fallita msg=%s uid=%s",
+                    message_id,
+                    m.get("imap_uid"),
+                )
+
     if html_body and (not body or len(body) < 40):
         derived = mail_provider._html_to_text(html_body)
         if derived:
@@ -1646,6 +1715,8 @@ async def sync_accounts_for_user(
                     "body_enc": encrypt_secret(m.get("body_text") or "", email_l),
                     "body_html": m.get("body_html"),
                     "receipts": m.get("receipts", []),
+                    # full sync → non è più uno stub peek
+                    "header_only": False,
                     "updated_at": datetime.utcnow(),
                 }
                 if existing:

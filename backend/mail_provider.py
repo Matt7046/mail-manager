@@ -869,6 +869,87 @@ def fetch_attachment(
             pass
 
 
+def fetch_message_by_uid(
+    host: str,
+    port: int,
+    user: str,
+    password: str = "",
+    *,
+    imap_uid: str,
+    folder: str = "INBOX",
+    account_type: str = "imap",
+    provider_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    FETCH completo di un messaggio per UID (usato per idratare stub header_only).
+    Supporta anche UID con prefisso gmraw: (Gmail All Mail).
+    """
+    hint = provider_hint or account_type
+    is_gmail = (account_type or "").lower() in ("google", "gmail") or (
+        hint or ""
+    ).lower() in ("google", "gmail")
+    uid_raw = (imap_uid or "").strip()
+    use_gmraw = uid_raw.startswith("gmraw:")
+    uid_s = uid_raw.split(":", 1)[1] if use_gmraw else uid_raw
+    if not uid_s.isdigit():
+        raise RuntimeError("UID messaggio non valido")
+
+    client, _used = connect_mailbox(
+        host,
+        port,
+        user,
+        password,
+        provider_hint=hint,
+        access_token=access_token,
+    )
+    try:
+        folder_l = (folder or "INBOX").lower()
+        if use_gmraw:
+            box = _resolve_gmail_all_mail(client)
+            if not box:
+                raise RuntimeError("Gmail All Mail non disponibile")
+            typ, _ = client.select(_quote_mailbox(box), readonly=True)
+            folder_label = "INBOX"
+        elif folder_l == "sent":
+            box = resolve_sent_mailbox(client)
+            if not box and is_gmail:
+                box = _resolve_gmail_all_mail(client)
+            if not box:
+                raise RuntimeError("Cartella Inviate non trovata")
+            typ, _ = client.select(_quote_mailbox(box), readonly=True)
+            folder_label = "sent"
+        elif folder_l == "trash":
+            # stub peek sono INBOX; trash resta locale
+            typ, _ = client.select("INBOX", readonly=True)
+            folder_label = "INBOX"
+        else:
+            typ, _ = client.select("INBOX", readonly=True)
+            folder_label = "INBOX"
+        if typ != "OK":
+            raise RuntimeError("Impossibile aprire la mailbox per il messaggio")
+
+        typ, msg_data = client.uid("FETCH", uid_s, "(FLAGS UID BODY.PEEK[])")
+        if typ != "OK" or not msg_data:
+            raise RuntimeError("FETCH messaggio fallito su IMAP")
+        parsed = _parse_fetch_items(
+            msg_data,
+            fallback_uid=uid_s,
+            folder_label=folder_label,
+            account_type=account_type,
+        )
+        if not parsed:
+            raise RuntimeError("Corpo messaggio vuoto su IMAP")
+        if use_gmraw:
+            parsed["imap_uid"] = f"gmraw:{parsed['imap_uid']}"
+        return parsed
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
 def _fetch_from_selected(
     client: imaplib.IMAP4,
     *,
